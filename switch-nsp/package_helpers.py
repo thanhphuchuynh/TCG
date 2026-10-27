@@ -37,7 +37,7 @@ def control_nacp(template,title_id=TITLE_ID):
     struct.pack_into('<I',data,0x302c,1) # English matches the provided icon; other console languages fall back.
     data[0x3034:0x3038]=bytes(4) # Screenshots allowed, automatic video capture disabled to preserve memory.
     data[0x3040:0x3060]=b'\xff'*32
-    data[0x3060:0x3070]=b'0.1.1'+bytes(11)
+    data[0x3060:0x3070]=b'0.1.2'+bytes(11)
     for offset,value in [(0x3038,title),(0x3070,title^0x1000),(0x3078,title),(0x30f8,title)]:struct.pack_into('<Q',data,offset,value)
     for offset in range(0x3080,0x30a8,8):struct.pack_into('<Q',data,offset,0)
     data[0x30a8:0x30b0]=b'tcg'+bytes(5)

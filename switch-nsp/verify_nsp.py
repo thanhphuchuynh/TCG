@@ -244,6 +244,13 @@ def verify(nsp_path, key, manifest_path=None, expected_name='TCG Card Shop Simul
         require(aci.read(0,4)==b'ACI0' and f'{unpack("<Q",aci.read(0x10,8))[0]:016x}'==title,'NPDM ACI0 title mismatch')
         require(acd.read(0x200,4)==b'ACID','Invalid NPDM ACID')
         low, high = unpack('<QQ',acd.read(0x210,16)); require(low <= int(title,16) <= high,'NPDM ACID title range mismatch')
+        for label,region,field in [('ACI0',aci,0x30),('ACID',acd,0x230)]:
+            ko,ks=unpack('<II',region.read(field,8))
+            require(ks % 4 == 0,'Misaligned NPDM capabilities')
+            caps=region.sub(ko,ks)
+            types=[value>>14 & 7 for value in unpack('<'+'I'*(ks//4),caps.read(0,ks)) if value & 0x3fff == 0x1fff]
+            require(types == [1],label+' must declare application program type, not applet')
+
         control=fsfiles(2,'romfs'); require('/control.nacp' in control,'Missing control.nacp')
         nacp=control['/control.nacp']; require(nacp.size>=0x4000,'Truncated control NACP')
         name=nacp.read(0,0x200).split(b'\0',1)[0].decode('utf-8')

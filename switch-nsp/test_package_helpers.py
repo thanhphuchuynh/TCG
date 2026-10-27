@@ -2,6 +2,10 @@ import os,struct,tempfile,unittest,json,hashlib
 from pathlib import Path
 from package_helpers import control_nacp,nro_nacp,private_keyset,safe_relative,prepare_payload,TITLE,AUTHOR,TITLE_ID
 class PackageHelperTests(unittest.TestCase):
+ def test_home_menu_title_is_application_not_applet(self):
+  config=json.loads((Path(__file__).resolve().parent/'bootstrap/hbl.json').read_text())
+  kinds=[row['value'] for row in config['kernel_capabilities'] if row['type']=='application_type']
+  self.assertEqual(kinds,[1],'Standalone HOME title must get application context, not applet context')
  def test_control_identity_and_memory_flags(self):
   data=control_nacp(bytes(0x4000))
   self.assertEqual(len(data),0x4000);self.assertEqual(data.split(b'\0')[0].decode(),TITLE)
