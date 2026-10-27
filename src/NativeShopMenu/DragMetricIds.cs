@@ -1,0 +1,1 @@
+public static class DragMetricIds { public static int Get(float v){if(v==72)return 0;if(v==147)return 1;if(v==164)return 2;if(v==75)return 3;if(v==-217)return 4;if(v==190)return 5;if(v==89)return 6;if(v==8)return 7;if(v==61)return 8;if(v==61f*.72f)return 9;return -1;} }

@@ -1,0 +1,19 @@
+# Generated builds, local game references, dependencies and private data
+out/
+build/
+refs/
+vendor/
+*.dll
+*.exe
+*.app/
+*.zip
+*.rar
+*.ico
+*.icns
+*.png
+*.gd
+*.log
+.env
+.env.*
+__pycache__/
+.DS_Store
