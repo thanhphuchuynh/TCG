@@ -79,7 +79,7 @@ class IntegrityTests(unittest.TestCase):
         levels = [empty_romfs()]
         for i in range(5):
             child = levels[0]
-            hashes = b''.join(hashlib.sha256(child[o:o+0x4000]).digest() for o in range(0,len(child),0x4000))
+            hashes = b''.join(hashlib.sha256(child[o:o+0x4000].ljust(0x4000,b'\0')).digest() for o in range(0,len(child),0x4000))
             levels.insert(0, hashes+bytes((-len(hashes)) % 0x4000))
         fs = bytearray(512); fs[:5] = b'\x02\x00\x00\x03\x01'
         fs[8:12] = b'IVFC'; struct.pack_into('<III',fs,12,0x20000,32,7)

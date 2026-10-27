@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include "tcg_prepare.h"
 
+/* Release AM sessions instead of scheduling NSO process exit before NRO handoff. */
+u32 __nx_applet_exit_mode = 2;
 static unsigned long long last_display;
 static void show_progress(const char *path, uint64_t complete, uint64_t total, void *opaque) {
     (void)path; (void)opaque;
@@ -20,6 +22,12 @@ static void show_progress(const char *path, uint64_t complete, uint64_t total, v
 }
 static void stop_with_message(const char *message) {
     printf("\x1b[10;1HPreparation stopped:\n%s\n\nExisting game files and saves were preserved.\nPress B to close.\n",message);
+    Result hid_rc = hidInitialize();
+    if (R_FAILED(hid_rc)) {
+        printf("Controller unavailable. Use HOME to close.\n");
+        while (appletMainLoop()) consoleUpdate(NULL);
+        svcExitProcess();
+    }
     PadState pad;
     padConfigureInput(1,HidNpadStyleSet_NpadStandard);
     padInitializeDefault(&pad);
@@ -28,7 +36,7 @@ static void stop_with_message(const char *message) {
         if (padGetButtonsDown(&pad)&HidNpadButton_B) break;
         consoleUpdate(NULL);
     }
-    consoleExit(NULL); appletExit(); svcExitProcess();
+    hidExit(); consoleExit(NULL); appletExit(); svcExitProcess();
 }
 void tcg_bootstrap_prepare(void) {
     Result rc=fsdevMountSdmc();

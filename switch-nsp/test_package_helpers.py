@@ -1,0 +1,27 @@
+import os,struct,tempfile,unittest
+from pathlib import Path
+from package_helpers import control_nacp,nro_nacp,private_keyset,safe_relative,TITLE,AUTHOR,TITLE_ID
+class PackageHelperTests(unittest.TestCase):
+ def test_control_identity_and_memory_flags(self):
+  data=control_nacp(bytes(0x4000))
+  self.assertEqual(len(data),0x4000);self.assertEqual(data.split(b'\0')[0].decode(),TITLE)
+  self.assertEqual(data[0x200:].split(b'\0')[0].decode(),AUTHOR)
+  self.assertEqual(struct.unpack_from('<Q',data,0x3038)[0],int(TITLE_ID,16))
+  self.assertEqual(data[0x3035],0);self.assertEqual(struct.unpack_from('<I',data,0x302c)[0],1)
+ def test_nro_metadata_bounds(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'runtime.nro';header=bytearray(0x80);header[0x10:0x14]=b'NRO0';struct.pack_into('<I',header,0x18,0x80)
+   assets=bytearray(0x38);assets[:4]=b'ASET';struct.pack_into('<QQ',assets,0x18,0x38,0x4000);p.write_bytes(header+assets+bytes(0x4000))
+   self.assertEqual(len(nro_nacp(p)),0x4000);p.write_bytes(b'bad')
+   with self.assertRaises((ValueError,struct.error)):nro_nacp(p)
+ def test_keyset_is_filtered_private_and_anonymous(self):
+  with tempfile.TemporaryDirectory() as t:
+   p=Path(t)/'test.keys';p.write_text('header_key = '+'11'*32+'\nkey_area_key_application_00 = '+'22'*16+'\ntitlekek_00 = '+'33'*16+'\nsecure_boot_key = '+'44'*16+'\n')
+   with private_keyset(p) as f:
+    self.assertEqual(os.fstat(f.fileno()).st_mode&0o777,0o600);f.seek(0);text=f.read().decode()
+    self.assertNotIn('secure_boot_key',text);self.assertIsInstance(f.name,int)
+ def test_no_private_keys_or_traversal_in_payload(self):
+  for path in ['../escape','/absolute','prod.keys','nested/title.keys','a\\b','a\nb']:
+   with self.subTest(path=path):
+    with self.assertRaises(ValueError):safe_relative(path)
+if __name__=='__main__':unittest.main()

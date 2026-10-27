@@ -81,13 +81,14 @@ def crypt_header(data, key, encrypt=False):
         result += operation.update(data[i*512:(i+1)*512])+operation.finalize()
     return bytes(result)
 
-def check_hashes(parent, child, block_size):
+def check_hashes(parent, child, block_size, pad_final=False):
     require(0 < block_size <= 16*1024*1024, 'Invalid hash block size')
     count = (child.size+block_size-1)//block_size
     require(parent.size >= count*32, 'Hash table too small')
     for i in range(count):
         block = child.sub(i*block_size, min(block_size, child.size-i*block_size))
-        require(block.digest() == parent.read(i*32, 32), 'Hierarchical SHA256 mismatch')
+        actual = hashlib.sha256(block.read(0, block.size).ljust(block_size, b'\0')).digest() if pad_final else block.digest()
+        require(actual == parent.read(i*32, 32), 'Hierarchical SHA256 mismatch')
 
 def romfs(v):
     fields = unpack('<10Q', v.read(0, 0x50))
@@ -186,7 +187,7 @@ def nca(v, key):
                 views.append(section.sub(offset,length)); blocks.append(1<<power); level_ranges.append((offset,length))
             nonoverlap(level_ranges)
             require(views[0].digest() == fs[0xc8:0xe8], 'IVFC master hash mismatch')
-            for j in range(1,6): check_hashes(views[j-1],views[j],blocks[j])
+            for j in range(1,6): check_hashes(views[j-1],views[j],blocks[j],pad_final=True)
             sections.append(('romfs',romfs(views[-1])))
         else:
             raise VerifyError('Unsupported NCA filesystem/hash type')
