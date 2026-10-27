@@ -18,6 +18,16 @@ Download the [latest plugin installer prerelease](https://github.com/thanhphuchu
 
 The only bundled DLL is our own compiled plugin in `installer/Payload`. Its manifest records the payload and public source hashes. Third-party reference assemblies are excluded. Rebuild it with `tools/build.py`, then refresh provenance with `python3 installer/prepare_payload.py --dll /path/to/NativeShopMenu.dll`. Build and test the installer using `python3 installer/build.py` on a Mac with Xcode command-line tools.
 
+## Build a complete local Mac app
+
+The [complete-app builder](complete-app/README.md) packages a native Apple Silicon game setup and installed mods supplied by you into one `.app`. Its launcher prepares a writable runtime in Application Support, preserves mod settings on repeat launches, and starts the modded game without Terminal. The current game requires macOS 26+.
+
+```sh
+python3 complete-app/build.py --game-dir /path/to/native-build --output-dir /path/to/local-release --zip
+```
+
+The complete game and mod payload stay local. This repository contains the launcher/build source and [verification notes](complete-app/VALIDATION.md); the public release remains the plugin-only installer.
+
 ## Build
 
 The tested environment uses Unity **2021.3.45f2**, an **ARM64 Mono/Metal** Mac player, BepInEx **5.4.23.6**, ShopOS **1.1.4**, and Enhanced Prefab Loader **6.2.16**. Private member layouts are version-sensitive; the menu adapter checks its bindings and pinned drag constants.
