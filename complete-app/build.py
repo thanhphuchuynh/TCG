@@ -2,8 +2,9 @@
 """Build a local complete Mac app using game and mod files supplied by the user.
 Never publishes/uploads its payload. Run on macOS with Swift command-line tools.
 """
-import argparse, hashlib, json, os, pathlib, plistlib, shutil, subprocess, tempfile
+import argparse, hashlib, json, os, pathlib, plistlib, shutil, subprocess, tempfile, zipfile
 from payload_manifest import describe_payload
+from zip_archive import create_archive
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--game-dir',type=pathlib.Path,required=True)
@@ -91,6 +92,6 @@ report={'app':str(final),'runtimeID':manifest['id'],'byteCount':byte_count,'file
 shutil.copy2(ROOT/'complete-app/README.md',out/'README.md')
 if a.zip:
     archive=out/'TCG-Card-Shop-Simulator-Modded-macOS-arm64.zip'
-    run('ditto','-c','-k','--sequesterRsrc','--keepParent',final,archive)
+    create_archive(final,archive)
     (out/'SHA256SUMS').write_text(sha(archive)+'  '+archive.name+'\n')
 print(json.dumps(report,indent=2),flush=True)
