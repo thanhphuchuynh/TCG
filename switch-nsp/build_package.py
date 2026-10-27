@@ -6,6 +6,10 @@ from package_helpers import TITLE_ID,TITLE,AUTHOR,digest,nro_nacp,control_nacp,p
 
 NOTES='''TCG Card Shop Simulator — experimental Switch compatibility NSP
 
+Version 0.1.1 fixes a launcher null-framebuffer crash before preparation.
+After installing this version, the HOME menu should show the preparation screen.
+Console execution of this correction still needs confirmation.
+
 This NSP bundles the clean Windows-x86/Mono/OpenGL base game and pinned Autorun
 test-build-4. It is not a native Unity Switch game and has not been console-tested.
 The Pokemon overhaul and other mod plugins from the Mac build are not included.
@@ -80,7 +84,7 @@ def main():
  (out/'README.txt').write_text(NOTES)
  print('Payload staged:',json.dumps(stage),flush=True)
  if a.prepare_only:return 0
- output=out/'TCG-Card-Shop-Simulator-Switch-Compat-0.1.0.nsp'
+ output=out/'TCG-Card-Shop-Simulator-Switch-Compat-0.1.1.nsp'
  if output.exists():raise ValueError('Completed output already exists; refusing overwrite')
  ncas=work/'ncas';ncas.mkdir(exist_ok=True)
  with private_keyset(a.keys) as key_stream:
