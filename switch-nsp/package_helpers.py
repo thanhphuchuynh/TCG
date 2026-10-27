@@ -82,7 +82,7 @@ def prepare_payload(handoff,romfs):
     handoff=Path(handoff);romfs=Path(romfs);payload=romfs/'payload'
     if payload.exists():raise ValueError('Refusing to replace an existing payload stage')
     entries=json.loads((handoff/'Verification/handoff-manifest.json').read_text())['files']
-    selected=[]
+    selected=[]; seen={}
     for item in entries:
         name=item['path']
         if name.startswith('Runtime/switch/wine/'):relative=name.removeprefix('Runtime/switch/wine/')
@@ -92,6 +92,11 @@ def prepare_payload(handoff,romfs):
         source=handoff/name
         if source.is_symlink() or not source.is_file() or source.stat().st_size!=item['bytes'] or digest(source)!=item['sha256']:raise ValueError('Source handoff integrity failed: '+name)
         if item['bytes']>0xffffffff:raise ValueError('A source file exceeds FAT32 limits')
+        identity=(item['bytes'],item['sha256'])
+        if relative in seen:
+            if seen[relative]!=identity:raise ValueError('Conflicting game/runtime payload path: '+relative)
+            continue
+        seen[relative]=identity
         selected.append((relative,source,item['bytes'],item['sha256']))
     if not selected:raise ValueError('No audited game/runtime files')
     payload.mkdir(parents=True)
