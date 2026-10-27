@@ -21,6 +21,12 @@ jobs:
           make -C switch-nsp/bootstrap RELEASE=1 -j2
       - name: Validate loader output
         run: python3 switch-nsp/extract_exefs.py switch-nsp/bootstrap/hbl.nsp output
+      - name: Record crash address symbols and retain debug files
+        run: |
+          cp switch-nsp/bootstrap/hbl.elf output/hbl.elf
+          cp switch-nsp/bootstrap/build/hbl.map output/hbl.map
+          docker run --rm -v "$PWD:/workspace" -w /workspace devkitpro/devkita64:latest /opt/devkitpro/devkitA64/bin/aarch64-none-elf-addr2line -afipe switch-nsp/bootstrap/hbl.elf 0xced0 0xbd38 0xbe3c 0x2b158 0x23a70 0x19fd8 0xe70 0x1d0 0x860 > output/crash-addresses.txt
+          cat output/crash-addresses.txt
       - uses: actions/upload-artifact@v4
         with:
           name: tcg-switch-bootstrap
