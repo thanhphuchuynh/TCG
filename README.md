@@ -12,6 +12,12 @@ This repository is **not a downloadable copy of the game or a complete standalon
 - **Compatibility helpers:** scoped macOS path/native-tool patches, verification utilities and pure helper tests. Original dependency DLLs are not distributed.
 - **Optional diagnostics:** a save-loading exception logger, plus a Unity editor callback for an icon supplied locally.
 
+## macOS installer
+
+Download the [latest plugin installer prerelease](https://github.com/thanhphuchuynh/TCG/releases). It installs our menu, credits and loading-tip plugin into a compatible native Mac game setup supplied by you, with backups and restore. The installer requires Apple Silicon and macOS 13+. It is ad-hoc signed, without Developer ID signing or notarization. See [installation instructions](installer/INSTALL.txt). It does not port the base Windows game.
+
+The only bundled DLL is our own compiled plugin in `installer/Payload`. Its manifest records the payload and public source hashes. Third-party reference assemblies are excluded. Rebuild it with `tools/build.py`, then refresh provenance with `python3 installer/prepare_payload.py --dll /path/to/NativeShopMenu.dll`. Build and test the installer using `python3 installer/build.py` on a Mac with Xcode command-line tools.
+
 ## Build
 
 The tested environment uses Unity **2021.3.45f2**, an **ARM64 Mono/Metal** Mac player, BepInEx **5.4.23.6**, ShopOS **1.1.4**, and Enhanced Prefab Loader **6.2.16**. Private member layouts are version-sensitive; the menu adapter checks its bindings and pinned drag constants.

@@ -1,0 +1,14 @@
+{
+  "sha256": "d6a7cb374017f928bf20e4c62c4b978b32ccb10d7d23f828adfa34c6397e4d1f",
+  "sources": {
+    "src/NativeShopMenu/CreditCatalog.cs": "3d691e2713aa379fc268b34054c532a86db39b5044cf916948e8f34f9860c359",
+    "src/NativeShopMenu/CreditsScroll.cs": "6319cb8f07527c8b0a366ae610f9c26efea34347a207264baec2ad91f87865de",
+    "src/NativeShopMenu/DragMetricIds.cs": "d3ae27edc7fd596b23d111ff339fab5b2c45b938fdeb0afa2762891b32a28122",
+    "src/NativeShopMenu/MenuGeometry.cs": "c8e35dd38e8b1bcad90c31cb33c06ff0739133b8d1edab6444759c05bc236bf2",
+    "src/NativeShopMenu/NativeCredits.cs": "5027230482774e6650ac9f4057cb2278941e1611995c7d651cb5cdf09f521a61",
+    "src/NativeShopMenu/NativeLoadingTips.cs": "43c1520e99ee09ac25a5b0eeda79d61341cfb06c53e15b7250a4f11d14fdfd62",
+    "src/NativeShopMenu/NativeMenuPanel.cs": "7a9090e9d896a5a963ec05d07343cc76d4c69dc3a7542f009a31fda11504e6cb",
+    "src/NativeShopMenu/NativeShopMenu.cs": "c25872034c3afdc61d0a096261894dc0f044708ca18c529a6f56a862746ae861"
+  },
+  "description": "Our NativeShopMenu, NativeCredits and NativeLoadingTips plugin only. Third-party reference assemblies excluded."
+}

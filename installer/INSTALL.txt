@@ -1,0 +1,28 @@
+TCG Plugin Installer v0.1.0 — macOS Apple Silicon
+
+1. Unzip TCG-Plugin-Installer-v0.1.0-macOS-arm64.zip and open the app.
+2. Quit your game. Choose its existing native macOS installation folder or .app.
+3. Click Install Plugins, then use your existing mod launcher to play.
+4. Press Tab in your shop for the menu and Credits.
+
+Requires an existing compatible ARM64 Mono Mac player with BepInEx 5.4.23.6,
+ShopOS 1.1.4 and Enhanced Prefab Loader 6.2.16 supplied by you.
+The installer requires macOS 13 or newer; game compatibility is separate.
+It does not convert the Windows game into a Mac game.
+
+Only NativeShopMenu.dll is installed. It provides the menu layout, credits and
+clear loading tips. Game files, mod assets, compatibility patches and saves
+are not included. No internet connection is needed for installation.
+
+Restore Previous Files restores the version present before the first install,
+or removes our DLL if none existed. Backups live in .tcg-native-installer in
+the game folder. Keep that folder until you no longer need restore.
+Manually edited installed files are preserved and require manual resolution.
+
+This experimental app is ad-hoc signed, without an Apple Developer ID or
+notarization. macOS may block opening it; see Apple's guidance for opening
+software from an unidentified developer if you decide to trust this release.
+No quarantine settings or system security settings are changed by this app.
+
+Project, source, validation and upstream credits:
+https://github.com/thanhphuchuynh/TCG

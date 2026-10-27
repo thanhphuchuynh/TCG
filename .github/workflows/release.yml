@@ -1,0 +1,27 @@
+name: Build macOS plugin installer
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Test, build and verify installer
+        run: python3 installer/build.py
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$RELEASE_TAG"
+          dist/TCG-Plugin-Installer-v0.1.0-macOS-arm64.zip
+          dist/INSTALL.txt dist/SHA256SUMS
+          --verify-tag --prerelease
+          --title "TCG Plugin Installer $RELEASE_TAG — macOS Apple Silicon"
+          --notes-file installer/RELEASE_NOTES.md
