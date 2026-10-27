@@ -17,10 +17,17 @@ static void show_progress(const char *path, uint64_t complete, uint64_t total, v
     (void)path; (void)opaque;
     if (complete < last_display + 16*1024*1024 && complete != total) return;
     last_display=complete;
-    printf("\x1b[7;1H%llu / %llu MiB (%u%%)          ",
+    uint64_t bounded = total && complete > total ? total : complete;
+    unsigned percent = total ? (unsigned)(((__uint128_t)bounded * 100) / total) : 0;
+    char bar[41];
+    unsigned filled = percent * 40 / 100;
+    memset(bar, '#', filled);
+    memset(bar + filled, '-', 40 - filled);
+    bar[40] = '\0';
+    printf("\x1b[7;1H[%s] %3u%%\x1b[K\x1b[8;1H%llu / %llu MiB copied\x1b[K",
+           bar, percent,
            (unsigned long long)(complete/(1024*1024)),
-           (unsigned long long)(total/(1024*1024)),
-           total ? (unsigned)(complete*100/total) : 0);
+           (unsigned long long)(total/(1024*1024)));
     consoleUpdate(NULL);
 }
 static void stop_with_message(const char *message) {
@@ -50,7 +57,7 @@ void tcg_bootstrap_prepare(void) {
     PrintConsole *screen = consoleInit(NULL);
     if (!screen || !screen->consoleInitialised)
         diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 42));
-    printf("\x1b[2;2HTCG Card Shop Simulator\n\nPreparing game files for the first launch.\nThis can take a few minutes. Keep the SD card inserted.\n");
+    printf("\x1b[2;2HTCG Card Shop Simulator\n\nPreparing game files for the first launch.\nThis can take a few minutes. Keep the SD card inserted.\n\x1b[7;1HChecking installation...\x1b[K");
     consoleUpdate(NULL);
     rc=romfsInit();
     if (R_FAILED(rc)) stop_with_message("Cannot open the installed game's bundled files.");

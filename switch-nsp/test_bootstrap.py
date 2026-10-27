@@ -23,6 +23,7 @@ DRIVER=r'''
 #include <switch.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include "tcg_prepare.h"
 static int window, console, bad_console;
@@ -33,7 +34,7 @@ Result hidInitialize(void){return 0;} Result romfsInit(void){return 0;}
 void __nx_win_init(void){require(!window);window=1;}
 void __nx_win_exit(void){require(window&&!console);window=0;}
 PrintConsole *consoleInit(PrintConsole*p){(void)p;screen.consoleInitialised=window&&!bad_console;console=screen.consoleInitialised;return &screen;}
-int tcg_test_printf(const char *s,...){(void)s;require(window&&console);return 0;}
+int tcg_test_printf(const char *s,...){require(window&&console);char text[1024];va_list a;va_start(a,s);int n=vsnprintf(text,sizeof(text),s,a);va_end(a);if(n>0)fwrite(text,1,(size_t)n,stdout);return n;}
 void consoleUpdate(PrintConsole*p){(void)p;require(window&&console);}
 void consoleExit(PrintConsole*p){(void)p;require(window&&console);console=0;}
 void appletExit(void){require(!window&&!console);} void hidExit(void){} void romfsExit(void){}
@@ -41,7 +42,7 @@ void fsdevUnmountAll(void){require(!window&&!console);}
 void diagAbortWithResult(Result r){(void)r;exit(42);} void svcExitProcess(void){exit(43);}
 void padConfigureInput(int a,int b){(void)a;(void)b;} void padInitializeDefault(PadState*p){(void)p;}
 void padUpdate(PadState*p){(void)p;} u64 padGetButtonsDown(PadState*p){(void)p;return 1;} bool appletMainLoop(void){return true;}
-int tcg_prepare(const char*a,const char*b,const char*c,const char*d,const TcgPrepareOptions*o){(void)a;(void)b;(void)c;(void)d;(void)o;require(window&&console);return 0;}
+int tcg_prepare(const char*a,const char*b,const char*c,const char*d,const TcgPrepareOptions*o){(void)a;(void)b;(void)c;(void)d;(void)o;require(window&&console);o->progress("test",32*1024*1024,64*1024*1024,o->opaque);o->progress("test",64*1024*1024,64*1024*1024,o->opaque);return 0;}
 const char *tcg_prepare_error(void){return "test error";}
 void tcg_bootstrap_prepare(void);
 int main(int argc,char **argv){(void)argv;bad_console=argc>1;mkdir("sdmc:",0777);mkdir("sdmc:/switch",0777);mkdir("sdmc:/switch/wine",0777);tcg_bootstrap_prepare();require(!window&&!console);return 0;}
@@ -55,8 +56,15 @@ class BootstrapTests(unittest.TestCase):
  @classmethod
  def tearDownClass(cls):cls.tmp.cleanup()
  def test_initializes_display_before_print_and_releases_it_before_handoff(self):
-  p=subprocess.run([str(self.root/'bootstrap')],cwd=self.root)
+  p=subprocess.run([str(self.root/'bootstrap')],cwd=self.root,capture_output=True,text=True)
   self.assertEqual(p.returncode,0,'Printed without an initialized display or failed cleanup ordering')
+ def test_preparation_displays_bar_and_copied_mebibytes(self):
+  p=subprocess.run([str(self.root/'bootstrap')],cwd=self.root,capture_output=True,text=True)
+  self.assertEqual(p.returncode,0)
+  self.assertIn('[####################--------------------]',p.stdout)
+  self.assertIn('32 / 64 MiB',p.stdout)
+  self.assertIn('[########################################]',p.stdout)
+  self.assertIn('100%',p.stdout)
  def test_failed_console_does_not_print_into_null_framebuffer(self):
   p=subprocess.run([str(self.root/'bootstrap'),'console-fails'],cwd=self.root)
   self.assertEqual(p.returncode,42,'Expected controlled diagnostic abort instead of null-framebuffer printing')
