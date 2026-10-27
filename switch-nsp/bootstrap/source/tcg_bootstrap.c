@@ -9,6 +9,9 @@
 
 /* Release AM sessions instead of scheduling NSO process exit before NRO handoff. */
 u32 __nx_applet_exit_mode = 2;
+/* The custom hbloader __appInit bypasses libnx default display initialization. */
+extern void __nx_win_init(void);
+extern void __nx_win_exit(void);
 static unsigned long long last_display;
 static void show_progress(const char *path, uint64_t complete, uint64_t total, void *opaque) {
     (void)path; (void)opaque;
@@ -36,14 +39,17 @@ static void stop_with_message(const char *message) {
         if (padGetButtonsDown(&pad)&HidNpadButton_B) break;
         consoleUpdate(NULL);
     }
-    hidExit(); consoleExit(NULL); appletExit(); svcExitProcess();
+    hidExit(); consoleExit(NULL); __nx_win_exit(); appletExit(); svcExitProcess();
 }
 void tcg_bootstrap_prepare(void) {
     Result rc=fsdevMountSdmc();
     if (R_FAILED(rc)) diagAbortWithResult(rc);
     rc=appletInitialize();
     if (R_FAILED(rc)) diagAbortWithResult(rc);
-    consoleInit(NULL);
+    __nx_win_init();
+    PrintConsole *screen = consoleInit(NULL);
+    if (!screen || !screen->consoleInitialised)
+        diagAbortWithResult(MAKERESULT(Module_HomebrewLoader, 42));
     printf("\x1b[2;2HTCG Card Shop Simulator\n\nPreparing game files for the first launch.\nThis can take a few minutes. Keep the SD card inserted.\n");
     consoleUpdate(NULL);
     rc=romfsInit();
@@ -61,5 +67,5 @@ void tcg_bootstrap_prepare(void) {
     if (fclose(handoff)!=0 || !ok) stop_with_message("Cannot finish the game launch request.");
     printf("\x1b[9;1HStarting the compatibility runtime...\n");
     consoleUpdate(NULL);
-    romfsExit(); consoleExit(NULL); appletExit(); fsdevUnmountAll();
+    romfsExit(); consoleExit(NULL); __nx_win_exit(); appletExit(); fsdevUnmountAll();
 }
