@@ -53,9 +53,9 @@ func runtimeSelfTests() throws {
     contender = nil
     let movedPayload = suite.appendingPathComponent("Moved App Payload")
     try fm.copyItem(at:payload,to:movedPayload)
-    let moved = try RuntimeManager(payload:movedPayload,storage:storage)
-    try moved.acquireLock()
-    try expect(try moved.prepare().path == runtime.path,"moving app reuses existing runtime")
+    var moved:RuntimeManager? = try RuntimeManager(payload:movedPayload,storage:storage)
+    try moved!.acquireLock()
+    try expect(try moved!.prepare().path == runtime.path,"moving app reuses existing runtime")
     try expect(try String(contentsOf:runtime.appendingPathComponent("BepInEx/config/Example.cfg"),encoding:.utf8) == "setting=changed","moving app preserves configuration")
     let interruptedStorage = suite.appendingPathComponent("interrupted")
     let interrupted = try RuntimeManager(payload:payload,storage:interruptedStorage,copy:{ _,destination in
@@ -69,7 +69,7 @@ func runtimeSelfTests() throws {
     let low = try RuntimeManager(payload:payload,storage:suite.appendingPathComponent("low"),availableBytes:{0})
     try low.acquireLock(); try rejects("insufficient disk space") { _ = try low.prepare() }
     try put("edited",runtime.appendingPathComponent("BepInEx/plugins/Example.dll"))
-    try rejects("edited immutable plugin") { _ = try moved.prepare() }
+    try rejects("edited immutable plugin") { _ = try moved!.prepare() }
     try expect(try String(contentsOf:runtime.appendingPathComponent("BepInEx/config/Example.cfg"),encoding:.utf8) == "setting=changed","integrity refusal preserves settings")
     try rejects("missing payload") { _ = try RuntimeManager(payload:suite.appendingPathComponent("missing"),storage:suite.appendingPathComponent("unused")) }
     var unsafe = manifest; unsafe["id"] = "../escape"
@@ -84,5 +84,13 @@ func runtimeSelfTests() throws {
     let unready = try RuntimeManager(payload:payload,storage:unreadyStorage); try unready.acquireLock()
     try rejects("existing unready runtime") { _ = try unready.prepare() }
     try expect(fm.fileExists(atPath:unreadyStorage.appendingPathComponent("test-v1/personal.txt").path),"unready folder not overwritten")
+    // A settings-only rebuild changes informational byteCount, not runtime compatibility.
+    try put("plugin",runtime.appendingPathComponent("BepInEx/plugins/Example.dll"))
+    moved = nil
+    var compatible = manifest; compatible["byteCount"] = 1025
+    try JSONSerialization.data(withJSONObject:compatible,options:[.sortedKeys]).write(to:movedPayload.appendingPathComponent("runtime.json"))
+    let rebuilt = try RuntimeManager(payload:movedPayload,storage:storage); try rebuilt.acquireLock()
+    try expect(try rebuilt.prepare().path == runtime.path,"settings-only rebuild reuses prepared runtime")
+    try expect(try String(contentsOf:runtime.appendingPathComponent("BepInEx/config/Example.cfg"),encoding:.utf8) == "setting=changed","settings-only rebuild preserves current settings")
     print("Complete-app runtime tests passed (\(count) assertions).")
 }

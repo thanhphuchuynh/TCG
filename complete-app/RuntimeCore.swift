@@ -25,6 +25,10 @@ final class RuntimeManager {
     private let fm = FileManager.default
     var runtimeURL:URL { storage.appendingPathComponent(manifest.id) }
     var logURL:URL { runtimeURL.appendingPathComponent("Launcher.log") }
+    private struct Compatibility:Codable {
+        let format:Int; let id:String; let gameApp:String
+        let criticalHashes:[String:String]; let requiredSizes:[String:Int64]
+    }
     private struct Receipt:Codable { let format:Int; let id:String; let manifestHash:String }
     static func hash(_ data:Data)->String { SHA256.hash(data:data).map{String(format:"%02x",$0)}.joined() }
     private static func safeRelative(_ path:String)->Bool {
@@ -33,7 +37,6 @@ final class RuntimeManager {
     init(payload:URL,storage:URL,copy:((URL,URL)throws->Void)? = nil,availableBytes:(()throws->Int64)? = nil) throws {
         self.payload = payload; self.storage = storage; self.availableBytes = availableBytes
         let data = try Data(contentsOf:payload.appendingPathComponent("runtime.json"))
-        manifestHash = Self.hash(data)
         manifest = try JSONDecoder().decode(RuntimeManifest.self,from:data)
         guard manifest.format == 1, !manifest.id.isEmpty, manifest.id.count <= 80,
               manifest.id.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 }),
@@ -45,6 +48,9 @@ final class RuntimeManager {
               manifest.criticalHashes.values.allSatisfy({$0.count == 64 && $0.utf8.allSatisfy{(48...57).contains($0) || (97...102).contains($0)}}) else {
             throw RuntimeFailure(message:"The bundled runtime manifest is invalid.")
         }
+        let compatibility = Compatibility(format:manifest.format,id:manifest.id,gameApp:manifest.gameApp,criticalHashes:manifest.criticalHashes,requiredSizes:manifest.requiredSizes)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        manifestHash = Self.hash(try encoder.encode(compatibility))
         self.copy = copy ?? { source,destination in
             let task = Process(); task.executableURL = URL(fileURLWithPath:"/usr/bin/ditto"); task.arguments = [source.path,destination.path]
             try task.run(); task.waitUntilExit()
