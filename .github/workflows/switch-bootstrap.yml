@@ -1,0 +1,29 @@
+name: Build Switch compatibility bootstrap
+on:
+  push:
+    branches: ['build/switch-compat-nsp']
+    paths: ['switch-nsp/**', '.github/workflows/switch-bootstrap.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compile open-source bootstrap (no game files or keys)
+        run: >-
+          docker run --rm -v "$PWD:/workspace" -w /workspace
+          devkitpro/devkita64:latest
+          make -C switch-nsp/bootstrap RELEASE=1 -j2
+      - name: Validate loader output
+        run: python3 switch-nsp/extract_exefs.py switch-nsp/bootstrap/hbl.nsp output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tcg-switch-bootstrap
+          path: output/
+          if-no-files-found: error
+          retention-days: 7

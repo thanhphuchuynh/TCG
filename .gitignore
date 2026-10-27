@@ -21,3 +21,9 @@ __pycache__/
 dist/
 
 .superpowers/
+
+# Private console keys and locally generated Switch packages.
+*.keys
+*.nsp
+*.nca
+switch-nsp/work/
