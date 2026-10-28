@@ -23,7 +23,9 @@ jobs:
           git -C upstream checkout 1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877
           git -C upstream submodule update --init horizon-dlls
       - name: Apply own runtime patches
-        run: git -C upstream apply --verbose "$PWD/patches/autorun-gc-suspension.patch"
+        run: |
+          git -C upstream apply --verbose "$PWD/patches/autorun-gc-suspension.patch"
+          git -C upstream apply --verbose "$PWD/patches/autorun-suspend-diagnostics.patch"
       - name: Install upstream Windows cross compiler
         run: |
           curl --fail --location --retry 3 -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260505/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64.tar.xz
@@ -66,3 +68,19 @@ jobs:
           path: upstream/development-artifact/
           if-no-files-found: error
           retention-days: 7
+
+  arm64-dispatcher:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned runtime source and apply own patches
+        run: |
+          git init upstream
+          git -C upstream remote add origin https://github.com/autorunhq/autorun.git
+          git -C upstream fetch --depth=1 origin 1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877
+          git -C upstream checkout --detach FETCH_HEAD
+          git -C upstream apply "$PWD/patches/autorun-gc-suspension.patch"
+          git -C upstream apply "$PWD/patches/autorun-suspend-diagnostics.patch"
+      - name: Execute actual ARM64 syscall dispatcher tests
+        run: sh upstream/horizon-wine/tests/arm64ec-dispatchers/run.sh

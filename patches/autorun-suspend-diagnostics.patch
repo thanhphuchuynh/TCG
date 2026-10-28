@@ -1,0 +1,1615 @@
+diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
+index 0cfd808b..f03943a2 100644
+--- a/dlls/ntdll/unix/horizon.c
++++ b/dlls/ntdll/unix/horizon.c
+@@ -62,6 +62,7 @@
+ #include "horizon_msg_queue.h"
+ #include "horizon_win_timers.h"
+ #include "horizon_threads.h"
++#include "horizon_suspend_diag.h"
+ #include "horizon_registry.h"
+ #include "horizon_read_redirect.h"
+ #include "horizon_object_dirs.h"
+@@ -84,6 +85,85 @@
+ #include <sys/iosupport.h>
+ #include "horizon_byte_pipe.h"
+ 
++/* Numeric diagnostics only: producers use bounded try-lock slots and never
++ * allocate, format output or acquire a Wine/server/CPU lock. */
++static struct horizon_diag_ring horizon_suspend_ring;
++static __thread struct horizon_diag_scope horizon_diag_current = { .syscall = ~0u };
++
++void horizon_diag_scope_push(struct horizon_diag_scope *scope, uint32_t syscall, uint64_t pc, uint64_t sp)
++{
++    *scope = horizon_diag_current;
++    horizon_diag_current = (struct horizon_diag_scope){ .syscall = syscall, .phase = HORIZON_DIAG_ENTRY, .pc = pc, .sp = sp };
++}
++
++void horizon_diag_scope_pop(struct horizon_diag_scope *scope)
++{
++    horizon_diag_current = *scope;
++}
++
++void horizon_diag_scope_phase(uint32_t phase)
++{
++    horizon_diag_current.phase = phase;
++}
++
++void horizon_diag_scope_reset(void)
++{
++    horizon_diag_current = (struct horizon_diag_scope){ .syscall = ~0u };
++}
++
++void horizon_diag_record(const struct horizon_diag_event *input)
++{
++    struct horizon_diag_event event = *input;
++    event.timestamp = armGetSystemTick();
++    event.syscall = horizon_diag_current.syscall;
++    event.phase = horizon_diag_current.phase;
++    event.pc = horizon_diag_current.pc;
++    event.sp = horizon_diag_current.sp;
++    horizon_diag_ring_write(&horizon_suspend_ring, &event);
++}
++
++void horizon_diag_save(struct horizon_diag_saved *saved, const struct horizon_diag_event *input)
++{
++    struct horizon_diag_event event = *input;
++    event.timestamp = armGetSystemTick();
++    event.syscall = horizon_diag_current.syscall;
++    event.phase = horizon_diag_current.phase;
++    event.pc = horizon_diag_current.pc;
++    event.sp = horizon_diag_current.sp;
++    if (event.kind == HORIZON_DIAG_PARK_ENTER)
++        event.address = __atomic_load_n(&saved->generation, __ATOMIC_ACQUIRE);
++    horizon_diag_saved_write(saved, &event);
++}
++
++/* Called only by the existing stall monitor, without tracked locks. Each
++ * read releases its slot before formatting/callback; no PE stack is read. */
++void horizon_suspend_diag_dump(void (*print)(const char *line))
++{
++    uint64_t end = __atomic_load_n(&horizon_suspend_ring.sequence, __ATOMIC_RELAXED);
++    uint64_t start = end > HORIZON_DIAG_CAPACITY ? end - HORIZON_DIAG_CAPACITY + 1 : 1;
++    unsigned shown = 0;
++    struct horizon_diag_event event;
++    char line[384];
++    if (!print) return;
++    for (uint64_t sequence = start; sequence <= end; sequence++)
++    {
++        if (!horizon_diag_ring_read(&horizon_suspend_ring, sequence, &event)) continue;
++        snprintf(line, sizeof(line), "[SUSPEND-DIAG] seq=%llu tick=%llu event=%u caller=%x target=%x handle=%llx old=%u new=%u status=%x syscall=%x phase=%u pc=%llx sp=%llx addr=%llx value=%x flags=%x",
++                 (unsigned long long)event.sequence, (unsigned long long)event.timestamp,
++                 event.kind, event.caller, event.target, (unsigned long long)event.handle,
++                 event.old_count, event.new_count, event.status, event.syscall, event.phase,
++                 (unsigned long long)event.pc, (unsigned long long)event.sp,
++                 (unsigned long long)event.address, event.value, event.flags);
++        print(line);
++        shown++;
++    }
++    snprintf(line, sizeof(line), "[SUSPEND-DIAG] end=%llu shown=%u dropped=%llu capacity=%u",
++             (unsigned long long)end, shown,
++             (unsigned long long)__atomic_load_n(&horizon_suspend_ring.dropped, __ATOMIC_RELAXED),
++             HORIZON_DIAG_CAPACITY);
++    print(line);
++}
++
+ /* PE entry points and callbacks currently execute on the libnx host stack.
+  * Keep the native TIB truthful; the WoW64 guest stack and allocation ownership
+  * remain in their original fields. */
+@@ -3351,6 +3431,7 @@ struct horizon_server_object
+ #endif
+     unsigned int thread_context_count;
+     int thread_context_valid;
++    struct horizon_diag_saved suspend_owner_history, suspend_park_history;
+     struct horizon_user_apc *apc_first, *apc_last;
+     unsigned int rootdir;
+     unsigned int name_len;
+@@ -6833,24 +6914,75 @@ static long long horizon_server_now(void)
+ }
+ 
+ #ifndef HORIZON_STANDALONE_SYNTAX
+-/* For the stall report: which threads are suspended, and whether they parked.
+- * ponytail: reads without the object lock, so a value may be a moment stale. */
++/* Durable histories are independent of ring capacity. Copy one target at a
++ * time with the existing object mutex, then release it before formatting or
++ * callbacks. A busy object mutex never blocks the stall monitor. TID order
++ * ensures the oldest/main target is reported before the fixed output bound. */
+ void horizon_server_report_suspended( void (*print)( const char *line ) )
+ {
+-    struct horizon_server_object *object;
+-    char line[160];
+-
+-    for (object = horizon_server_threads; object; object = object->thread_next)
++    unsigned int cursor = 0;
++    char line[384];
++    if (!print) return;
++    for (unsigned int row = 0; row < 256; row++)
+     {
+-        TEB *teb = (TEB *)(ULONG_PTR)object->thread.teb;
+-
+-        if (!object->thread.suspend || object->thread.terminated) continue;
+-        snprintf( line, sizeof(line), "[STALL] tid %04x suspended %d started %d parked %d contexts %u doorbell %d",
+-                  object->thread.tid, object->thread.suspend, object->thread.started,
+-                  object->thread_context_valid, object->thread_context_count,
+-                  teb ? ((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell : -1 );
+-        print( line );
++        struct horizon_server_object *object, *selected = NULL;
++        struct horizon_diag_event owner, park;
++        unsigned int tid, count, started, parked, contexts, owner_valid, park_valid;
++        int doorbell = -1;
++        uint64_t park_generation;
++        if (pthread_mutex_trylock(&horizon_server_objects_mutex))
++        {
++            print("[STALL] suspended snapshot busy");
++            return;
++        }
++        for (object = horizon_server_threads; object; object = object->thread_next)
++            if (object->thread.tid > cursor && object->thread.suspend && !object->thread.terminated &&
++                (!selected || object->thread.tid < selected->thread.tid)) selected = object;
++        if (!selected)
++        {
++            pthread_mutex_unlock(&horizon_server_objects_mutex);
++            return;
++        }
++        tid = selected->thread.tid;
++        count = selected->thread.suspend;
++        started = selected->thread.started;
++        parked = selected->thread_context_valid;
++        contexts = selected->thread_context_count;
++        owner_valid = horizon_diag_saved_read(&selected->suspend_owner_history, &owner);
++        park_valid = horizon_diag_saved_read(&selected->suspend_park_history, &park);
++        park_generation = __atomic_load_n(&selected->suspend_park_history.generation, __ATOMIC_ACQUIRE);
++        if (selected->thread.teb)
++        {
++            TEB *teb = (TEB *)(ULONG_PTR)selected->thread.teb;
++            if (teb->ChpeV2CpuAreaInfo && teb->ChpeV2CpuAreaInfo->SuspendDoorbell)
++                doorbell = __atomic_load_n(teb->ChpeV2CpuAreaInfo->SuspendDoorbell, __ATOMIC_ACQUIRE);
++            else doorbell = __atomic_load_n(&((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell, __ATOMIC_ACQUIRE);
++        }
++        pthread_mutex_unlock(&horizon_server_objects_mutex);
++        cursor = tid;
++        snprintf(line, sizeof(line), "[STALL] tid %04x suspended %u started %u parked %u contexts %u doorbell %d",
++                 tid, count, started, parked, contexts, doorbell);
++        print(line);
++        if (owner_valid)
++        {
++            snprintf(line, sizeof(line), "[STALL] suspend-owner tid=%04x caller=%04x handle=%x old=%u new=%u revision=%llu tick=%llu",
++                     tid, owner.caller, (unsigned int)owner.handle, owner.old_count, owner.new_count,
++                     (unsigned long long)owner.sequence, (unsigned long long)owner.timestamp);
++            print(line);
++        }
++        else print("[STALL] suspend-owner unavailable");
++        if (park_valid)
++        {
++            snprintf(line, sizeof(line), "[STALL] suspend-park tid=%04x syscall=%x phase=%u pc=%llx sp=%llx status=%x revision=%llu tick=%llu generation=%llu current_generation=%llu generation_match=%u",
++                     tid, park.syscall, park.phase, (unsigned long long)park.pc, (unsigned long long)park.sp, park.status,
++                     (unsigned long long)park.sequence, (unsigned long long)park.timestamp,
++                     (unsigned long long)park.address, (unsigned long long)park_generation,
++                     park.address == park_generation);
++            print(line);
++        }
++        else print("[STALL] suspend-park unavailable");
+     }
++    print("[STALL] suspended snapshot truncated after 256 targets");
+ }
+ #endif
+ 
+@@ -7036,7 +7168,15 @@ static int horizon_server_handle_init_process_done( struct horizon_server_connec
+     }
+ 
+     pthread_mutex_lock( &horizon_server_objects_mutex );
+-    if (connection->thread) connection->thread->thread.teb = request->teb;
++    if (connection->thread)
++    {
++        connection->thread->thread.teb = request->teb;
++#ifndef HORIZON_STANDALONE_SYNTAX
++        if (request->teb)
++            __atomic_store_n(&((struct teb_data *)&((TEB *)(ULONG_PTR)request->teb)->GdiTebBatch)->suspend_park_history,
++                             &connection->thread->suspend_park_history, __ATOMIC_RELEASE);
++#endif
++    }
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+ 
+     memset( &reply, 0, sizeof(reply) );
+@@ -7067,6 +7207,11 @@ static int horizon_server_handle_init_thread( struct horizon_server_connection *
+     {
+         connection->thread->thread.teb = request->teb;
+         connection->thread->thread.entry = request->entry;
++#ifndef HORIZON_STANDALONE_SYNTAX
++        if (request->teb)
++            __atomic_store_n(&((struct teb_data *)&((TEB *)(ULONG_PTR)request->teb)->GdiTebBatch)->suspend_park_history,
++                             &connection->thread->suspend_park_history, __ATOMIC_RELEASE);
++#endif
+     }
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+ 
+@@ -11903,6 +12048,22 @@ static void horizon_server_set_suspend_doorbell_locked( struct horizon_server_ob
+     else
+         __atomic_store_n( &((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell, value, __ATOMIC_RELEASE );
+ }
++/* flags bit 0: actual server park; bit 1: current suspension doorbell. */
++static unsigned int horizon_server_suspend_flags_locked(struct horizon_server_object *object)
++{
++    TEB *teb;
++    int doorbell = 0;
++    if (!object) return 0;
++    teb = (TEB *)(ULONG_PTR)object->thread.teb;
++    if (teb)
++    {
++        if (horizon_server_has_chpe_doorbell_locked(object))
++            doorbell = __atomic_load_n(teb->ChpeV2CpuAreaInfo->SuspendDoorbell, __ATOMIC_ACQUIRE);
++        else doorbell = __atomic_load_n(&((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell, __ATOMIC_ACQUIRE);
++    }
++    return !!object->thread_context_valid | (!!doorbell << 1);
++}
++
+ #endif
+ 
+ /* A client thread and its connection thread take turns, so they share a core:
+@@ -12015,6 +12176,12 @@ static int horizon_server_handle_resume_thread( struct horizon_server_connection
+             horizon_server_set_suspend_doorbell_locked( object, 0 );
+ #endif
+     }
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit(HORIZON_DIAG_SERVER_RESUME, connection->tid, object ? object->thread.tid : 0,
++                      request->handle, object ? reply.count : 0, object ? object->thread.suspend : 0,
++                      status, 0, object ? object->thread_context_count : 0,
++                      horizon_server_suspend_flags_locked(object));
++#endif
+     horizon_server_signal_changed_locked();  /* the start gate */
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+     reply.header.error = status;
+@@ -12036,9 +12203,23 @@ static int horizon_server_handle_suspend_thread( struct horizon_server_connectio
+         status = horizon_thread_suspend( &object->thread, &reply.count );
+ #ifndef HORIZON_STANDALONE_SYNTAX
+         if (!status && object->thread.started && !reply.count)
++        {
++            /* The target is the only writer of park payload. A separate
++             * generation marks new cycles without clearing an in-flight or
++             * retained park record before the target reaches server_select. */
++            if (!object->thread_context_valid)
++                __atomic_add_fetch(&object->suspend_park_history.generation, 1, __ATOMIC_RELEASE);
+             horizon_server_set_suspend_doorbell_locked( object, 1 );
++        }
+ #endif
+     }
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit_saved(!status && object ? &object->suspend_owner_history : NULL,
++                      HORIZON_DIAG_SERVER_SUSPEND, connection->tid, object ? object->thread.tid : 0,
++                      request->handle, object ? reply.count : 0, object ? object->thread.suspend : 0,
++                      status, 0, object ? object->thread_context_count : 0,
++                      horizon_server_suspend_flags_locked(object));
++#endif
+     if (!status) horizon_server_signal_changed_locked();
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+     reply.header.error = status;
+@@ -12095,6 +12276,10 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+     int found = 0;
+ 
+     memset( &reply, 0, sizeof(reply) );
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit(HORIZON_DIAG_GET_CONTEXT, connection->tid, 0, request->handle,
++                      0, 0, 0, 0, request->machine, request->flags);
++#endif
+     pthread_mutex_lock( &horizon_server_objects_mutex );
+     if ((object = horizon_server_get_thread_locked( request->handle, &status )))
+     {
+@@ -12128,6 +12313,12 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+             }
+         }
+     }
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit(HORIZON_DIAG_GET_CONTEXT_RESULT, connection->tid, object ? object->thread.tid : 0,
++                      request->handle, object ? object->thread.suspend : 0, object ? object->thread.suspend : 0,
++                      status, 0, object ? object->thread_context_count : 0,
++                      horizon_server_suspend_flags_locked(object));
++#endif
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+     reply.header.error = status;
+     if (!status && found) reply.header.reply_size = sizeof(context);
+@@ -12147,6 +12338,10 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
+     int found = 0;
+ 
+     memset( &reply, 0, sizeof(reply) );
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit(HORIZON_DIAG_SET_CONTEXT, connection->tid, 0, request->handle,
++                      0, 0, 0, 0, 0, request->native_flags);
++#endif
+     count = data_size / sizeof(*contexts);
+     if (!count || count > 2 || data_size != count * sizeof(*contexts)) status = HORIZON_STATUS_INVALID_PARAMETER;
+     else
+@@ -12177,6 +12372,12 @@ static int horizon_server_handle_set_thread_context( struct horizon_server_conne
+                 if (!found && !status) status = HORIZON_STATUS_NOT_SUPPORTED;
+             }
+         }
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++    horizon_diag_emit(HORIZON_DIAG_SET_CONTEXT_RESULT, connection->tid, object ? object->thread.tid : 0,
++                      request->handle, object ? object->thread.suspend : 0, object ? object->thread.suspend : 0,
++                      status, 0, object ? object->thread_context_count : 0,
++                      horizon_server_suspend_flags_locked(object));
++#endif
+         pthread_mutex_unlock( &horizon_server_objects_mutex );
+     }
+     reply.header.error = status;
+@@ -16468,6 +16669,11 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
+                     memcpy( thread->thread_contexts, suspend_contexts,
+                             suspend_context_count * sizeof(*suspend_contexts) );
+                 thread->thread_context_valid = 1;
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++                horizon_diag_emit(HORIZON_DIAG_SERVER_PARK, connection->tid, thread->thread.tid, 0,
++                                  thread->thread.suspend, thread->thread.suspend, 0, 0,
++                                  suspend_context_count, 1);
++#endif
+                 horizon_server_signal_changed_locked();
+             }
+             while (thread->thread.suspend && !thread->thread.terminated)
+@@ -16475,6 +16681,11 @@ static int horizon_server_handle_select( struct horizon_server_connection *conne
+                 horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
+                 horizon_server_quit_check_locked();
+             }
++#if defined(__SWITCH__) && !defined(HORIZON_STANDALONE_SYNTAX)
++            horizon_diag_emit(HORIZON_DIAG_SERVER_UNPARK, connection->tid, thread->thread.tid, 0,
++                              thread->thread.suspend, thread->thread.suspend, 0, 0,
++                              thread->thread_context_count, thread->thread.terminated);
++#endif
+             thread->thread_contexts = NULL;
+             thread->thread_context_valid = 0;
+             thread->thread_context_count = 0;
+diff --git a/dlls/ntdll/unix/horizon_private.h b/dlls/ntdll/unix/horizon_private.h
+index af440aff..04f67404 100644
+--- a/dlls/ntdll/unix/horizon_private.h
++++ b/dlls/ntdll/unix/horizon_private.h
+@@ -14,6 +14,7 @@
+ 
+ #ifdef __SWITCH__
+ #include <stddef.h>
++#include "horizon_suspend_diag.h"
+ #include <sys/types.h>
+ struct pollfd;
+ extern int horizon_poll_one( struct pollfd *fd, int timeout );
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index 1f98618f..2a02db31 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -85,6 +85,7 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
+     horizon_trace( "[CONTINUE] flags=%08x pc=%llx sp=%llx x18=%llx\n",
+                    context->ContextFlags, (unsigned long long)context->Pc,
+                    (unsigned long long)context->Sp, (unsigned long long)context->X18 );
++    if (&horizon_diag_scope_reset) horizon_diag_scope_reset();
+     horizon_continue_context( context );
+     return STATUS_UNSUCCESSFUL; /* The restore routine does not return. */
+ }
+@@ -200,8 +201,17 @@ void horizon_park_if_suspended(void)
+     CONTEXT context;
+ 
+     if (!__atomic_load_n( &data->suspend_doorbell, __ATOMIC_ACQUIRE )) return;
+-    if (horizon_capture_context( &context )) return;
+-    wait_suspend( &context );
++    {
++        int failed = horizon_capture_context( &context );
++        unsigned int tid = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
++        horizon_diag_emit_saved(__atomic_load_n(&data->suspend_park_history, __ATOMIC_ACQUIRE),
++                          HORIZON_DIAG_PARK_ENTER, tid, tid, 0, 0, 0, failed, 0,
++                          __atomic_load_n(&data->suspend_doorbell, __ATOMIC_ACQUIRE), 0);
++        if (failed) return;
++        wait_suspend( &context );
++        horizon_diag_emit(HORIZON_DIAG_PARK_EXIT, tid, tid, 0, 0, 0, 0, 0,
++                          __atomic_load_n(&data->suspend_doorbell, __ATOMIC_ACQUIRE), 0);
++    }
+ }
+ 
+ /* Calls a PE function with two arguments and x18 = teb, returning its result. */
+@@ -397,6 +407,7 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     PEB *peb = teb ? teb->Peb : NULL;
+     KERNEL_CALLBACK_PROC *table;
+     struct switch_callback_frame *frame;
++    struct horizon_diag_scope diag_scope;
+ 
+     if (ret_ptr) *ret_ptr = NULL;
+     if (ret_len) *ret_len = 0;
+@@ -429,6 +440,9 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     frame->status = STATUS_SUCCESS;
+     switch_cb_top = frame;
+ 
++    /* NtCallbackReturn longjmps past its dispatcher. Save the outer scope by
++     * value here and restore it at the landing point on both return paths. */
++    if (&horizon_diag_scope_push) horizon_diag_scope_push(&diag_scope, ~0u, 0, 0);
+     if (!setjmp( frame->jmp ))
+     {
+         /* callback returned normally (no NtCallbackReturn): status is its retval */
+@@ -436,6 +450,7 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     }
+     /* else: NtCallbackReturn longjmp'd here with frame.{ret_ptr,ret_len,status} set */
+ 
++    if (&horizon_diag_scope_pop) horizon_diag_scope_pop(&diag_scope);
+     switch_cb_top = frame->prev;
+     free( frame->args );
+     frame->args = NULL;
+@@ -618,11 +633,13 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+                               ULONG_PTR x2, ULONG_PTR x3,
+                               ULONG_PTR x4, ULONG_PTR x5,
+                               ULONG_PTR x6, ULONG_PTR x7,
+-                              unsigned int syscall_id )
++                              unsigned int syscall_id, ULONG_PTR caller_pc )
+ {
+     unsigned int table_idx = (syscall_id >> 12) & 3;
+     unsigned int func_idx  = syscall_id & 0xfff;
+ #ifdef __SWITCH__
++    struct horizon_diag_scope diag_scope;
++    if (&horizon_diag_scope_push) horizon_diag_scope_push(&diag_scope, syscall_id, caller_pc, (ULONG_PTR)stack_args);
+     /* + and - ask for the launcher back. A thread cannot be ended from outside
+      * on Horizon, so each ends itself here, where every one of them passes. */
+     {
+@@ -641,11 +658,17 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+                          !(table_idx == 1 && func_idx == 1051); /* NtUserGetMessage idle polling */
+ 
+     if (func_idx >= table->ServiceLimit)
++    {
++        if (&horizon_diag_scope_pop) horizon_diag_scope_pop(&diag_scope);
+         return STATUS_INVALID_SYSTEM_SERVICE;
++    }
+ 
+     handler = (ULONG_PTR *)table->ServiceTable[func_idx];
+     if (!handler)
++    {
++        if (&horizon_diag_scope_pop) horizon_diag_scope_pop(&diag_scope);
+         return STATUS_INVALID_SYSTEM_SERVICE;
++    }
+     /* winebox64 reads each x86 syscall's stack arguments through this. */
+     if ((void *)handler == (void *)NtReadVirtualMemory) trace_syscall = FALSE;
+     else if (!(++wine_nx_syscall_sample & 63))
+@@ -680,6 +703,7 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+                                          ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR,
+                                          ULONG_PTR,ULONG_PTR,ULONG_PTR,ULONG_PTR);
+ 
++    if (&horizon_diag_scope_phase) horizon_diag_scope_phase(HORIZON_DIAG_HANDLER);
+     if (arg_bytes <= 64)
+     {
+         result = ((syscall_func_8)handler)(x0,x1,x2,x3,x4,x5,x6,x7);
+@@ -713,7 +737,9 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+     }
+ 
+ #ifdef __SWITCH__
++    if (&horizon_diag_scope_phase) horizon_diag_scope_phase(HORIZON_DIAG_RETURN);
+     horizon_park_if_suspended();
++    if (&horizon_diag_scope_pop) horizon_diag_scope_pop(&diag_scope);
+ #endif
+     return result;
+ }
+@@ -730,10 +756,11 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+  *   sp    = PE caller stack (with extra args if any)
+  *
+  * We save the caller's SP (for stack args) and call wine_nx_do_syscall
+- * with: (stack_args, x0, x1, x2, x3, x4, x5, x6, x7, syscall_id)
++ * with: (stack_args, x0, x1, x2, x3, x4, x5, x6, x7, syscall_id, caller_pc)
+  *
+- * wine_nx_do_syscall takes 10 args = 80 bytes.  First 8 go in x0-x7,
+- * the last 2 (x7_orig, syscall_id) go on the stack.
++ * wine_nx_do_syscall takes 11 args. First 8 go in x0-x7; the last 3
++ * (x7_orig, syscall_id, saved PE caller PC) use a 32-byte aligned stack area.
++ * The caller PC comes from our owned dispatcher frame, not a PE stack walk.
+  */
+ __asm__(
+     ".global __wine_syscall_dispatcher\n"
+@@ -781,12 +808,14 @@ __asm__(
+     "    mov x9, x6\n"          /* save x6 */
+     "    mov x6, x10\n"         /* orig x5 */
+     "    mov x7, x9\n"          /* orig x6 */
+-    "    /* remaining 2 args go on stack: orig x7 and syscall_id */\n"
+-    "    stp x21, x19, [sp, #-16]!\n"  /* [sp] = orig x7, [sp+8] = syscall_id */
++    "    /* remaining args go on stack: orig x7, syscall_id and caller_pc */\n"
++    "    stp x21, x19, [sp, #-32]!\n"  /* [sp] = orig x7, [sp+8] = syscall_id */
++    "    ldr x10, [x29, #8]\n"       /* saved PE caller PC in our dispatcher frame */
++    "    str x10, [sp, #16]\n"
+ 
+     "    bl wine_nx_do_syscall\n"
+ 
+-    "    add sp, sp, #16\n"     /* pop stack args */
++    "    add sp, sp, #32\n"     /* pop stack args */
+     "    /* x0 = NTSTATUS result; force x18 back to the current Wine TEB. */\n"
+     "    mov x19, x0\n"
+     "    bl wine_nx_current_teb\n"
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 43c5d67b..39178f21 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -3639,8 +3639,13 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
+ #ifdef USE_FUTEX
+     {
+         LONG *futex = &entry->futex;
+-        if (!InterlockedExchange( futex, 1 ))
+-            futex_wake_one( futex );
++        LONG previous = InterlockedExchange( futex, 1 );
++        if (!previous) futex_wake_one( futex );
++#ifdef __SWITCH__
++        horizon_diag_emit(HORIZON_DIAG_ALERT, HandleToULong(NtCurrentTeb()->ClientId.UniqueThread),
++                          HandleToULong(tid), 0, 0, 0, STATUS_SUCCESS,
++                          (ULONG_PTR)futex, previous, 0);
++#endif
+         return STATUS_SUCCESS;
+     }
+ #elif defined(HAVE_KQUEUE)
+@@ -3703,6 +3708,11 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
+         LONG *futex = &entry->futex;
+         ULONGLONG end;
+         int ret;
++#ifdef __SWITCH__
++        unsigned int diag_tid = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
++        horizon_diag_emit(HORIZON_DIAG_WAIT_ALERT, diag_tid, diag_tid, (ULONG_PTR)address,
++                          0, 0, 0, (ULONG_PTR)futex, __atomic_load_n(futex, __ATOMIC_RELAXED), !!timeout);
++#endif
+ 
+         if (timeout)
+         {
+@@ -3726,8 +3736,21 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
+             else
+                 ret = futex_wait( futex, 0, NULL );
+ 
+-            if (ret == -1 && errno == ETIMEDOUT) return STATUS_TIMEOUT;
++            if (ret == -1 && errno == ETIMEDOUT)
++            {
++#ifdef __SWITCH__
++                horizon_diag_emit(HORIZON_DIAG_WAIT_ALERT_RESULT, diag_tid, diag_tid, (ULONG_PTR)address,
++                                  0, 0, STATUS_TIMEOUT, (ULONG_PTR)futex,
++                                  __atomic_load_n(futex, __ATOMIC_RELAXED), 0);
++#endif
++                return STATUS_TIMEOUT;
++            }
+         }
++#ifdef __SWITCH__
++        horizon_diag_emit(HORIZON_DIAG_WAIT_ALERT_RESULT, diag_tid, diag_tid, (ULONG_PTR)address,
++                          0, 0, STATUS_ALERTED, (ULONG_PTR)futex,
++                          __atomic_load_n(futex, __ATOMIC_RELAXED), 0);
++#endif
+         return STATUS_ALERTED;
+     }
+ #elif defined(HAVE_KQUEUE)
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index 53816b4f..d9229690 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1848,6 +1848,11 @@ static __thread BOOL horizon_cpu_suspending;
+ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
+ {
+     unsigned int ret;
++#ifdef __SWITCH__
++    unsigned int caller = HandleToULong(NtCurrentTeb()->ClientId.UniqueThread);
++    horizon_diag_emit(HORIZON_DIAG_SUSPEND_ENTER, caller, 0, (ULONG_PTR)handle, 0, 0, 0,
++                      (ULONG_PTR)count, 0, horizon_cpu_suspending);
++#endif
+ 
+ #ifdef __SWITCH__
+     /* Windows suspends a thread of a WoW64 process through the CPU backend
+@@ -1864,8 +1869,12 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
+         if (suspend_local_thread)
+         {
+             horizon_cpu_suspending = TRUE;
++            horizon_diag_emit(HORIZON_DIAG_BACKEND_ENTER, caller, 0, (ULONG_PTR)handle, 0, 0, 0, 0, 0, 1);
+             ret = horizon_call_pe2( suspend_local_thread, (ULONG_PTR)handle, (ULONG_PTR)count, NtCurrentTeb() );
++            horizon_diag_emit(HORIZON_DIAG_BACKEND_EXIT, caller, 0, (ULONG_PTR)handle, 0, 0, ret, 0, 0, 1);
+             horizon_cpu_suspending = FALSE;
++            horizon_diag_emit(HORIZON_DIAG_SUSPEND_EXIT, caller, 0, (ULONG_PTR)handle, 0, 0, ret,
++                              (ULONG_PTR)count, !ret && count ? *count : ~0u, 0);
+             return ret;
+         }
+     }
+@@ -1880,6 +1889,10 @@ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
+         }
+     }
+     SERVER_END_REQ;
++#ifdef __SWITCH__
++    horizon_diag_emit(HORIZON_DIAG_SUSPEND_EXIT, caller, 0, (ULONG_PTR)handle, 0, 0, ret,
++                      (ULONG_PTR)count, !ret && count ? *count : ~0u, horizon_cpu_suspending);
++#endif
+     return ret;
+ }
+ 
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index 5445b3d4..e8be70ae 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -143,6 +143,9 @@ static inline struct thread_data *get_thread_data(void)
+     return pthread_getspecific( thread_data_key );
+ }
+ 
++#ifdef __SWITCH__
++#include "horizon_suspend_diag.h"
++#endif
+ /* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
+ struct teb_data
+ {
+@@ -153,6 +156,7 @@ struct teb_data
+ #ifdef __SWITCH__
+     struct thread_data       *thread;
+     int                       suspend_doorbell; /* set by the server while the thread is suspended */
++    struct horizon_diag_saved *suspend_park_history; /* owned by the live server thread object */
+ #endif
+ };
+ 
+diff --git a/horizon-wine/check-horizon-threads.sh b/horizon-wine/check-horizon-threads.sh
+index e1629a91..a064039c 100644
+--- a/horizon-wine/check-horizon-threads.sh
++++ b/horizon-wine/check-horizon-threads.sh
+@@ -14,3 +14,7 @@ cc="${CC:-clang}"
+ python3 "$root/horizon-wine/tests/check_select_wait.py"
+ python3 "$root/horizon-wine/tests/check_horizon_fast_sync.py"
+ python3 "$root/horizon-wine/tests/check_horizon_suspend.py"
++python3 "$root/horizon-wine/tests/check_suspend_diagnostics.py"
++python3 "$root/horizon-wine/tests/check_suspend_diag_alerts.py"
++python3 "$root/horizon-wine/tests/check_suspend_diag_dispatch.py"
++python3 "$root/horizon-wine/tests/check_callback_lifetime.py"
+diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
+index b17b617b..88014d6f 100644
+--- a/horizon-wine/source/runtime.c
++++ b/horizon-wine/source/runtime.c
+@@ -458,6 +458,7 @@ static void open_game_log( const char *target )
+ }
+ 
+ extern void horizon_server_report_suspended( void (*print)( const char *line ) ) __attribute__((weak));
++extern void horizon_suspend_diag_dump( void (*print)( const char *line ) ) __attribute__((weak));
+ 
+ static void stall_watch( void *arg )
+ {
+@@ -488,6 +489,7 @@ static void stall_watch( void *arg )
+             log_line( "[STALL] no frame drawn for %u s; where the threads are standing", quiet * 5 );
+             wine_nx_threads_report_stalled();
+             if (horizon_server_report_suspended) horizon_server_report_suspended( wine_nx_runtime_trace );
++            if (horizon_suspend_diag_dump) horizon_suspend_diag_dump( wine_nx_runtime_trace );
+             reported++;
+         }
+     }
+diff --git a/horizon-wine/tests/arm64ec-dispatchers/dispatchers_test.c b/horizon-wine/tests/arm64ec-dispatchers/dispatchers_test.c
+index e6aa5887..f1b15d63 100644
+--- a/horizon-wine/tests/arm64ec-dispatchers/dispatchers_test.c
++++ b/horizon-wine/tests/arm64ec-dispatchers/dispatchers_test.c
+@@ -21,7 +21,7 @@ unsigned char stale_teb[16], authoritative_teb[0x68], fake_peb[0x370];
+ uint64_t native_bitmap[32];
+ void *wine_nx_arm64ec_dispatch_ret;
+ 
+-static uint64_t recorded_args[8], recorded_stack_args[8], recorded_stack_ptr;
++static uint64_t recorded_args[8], recorded_stack_args[8], recorded_stack_ptr, recorded_caller_pc;
+ static uint64_t recorded_unix[3];
+ static unsigned int recorded_syscall_id;
+ static unsigned int failures;
+@@ -36,7 +36,7 @@ extern void clobber_vectors(void);
+ uint64_t wine_nx_do_syscall( uint64_t *stack_args,
+                              uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                              uint64_t x4, uint64_t x5, uint64_t x6, uint64_t x7,
+-                             unsigned int syscall_id )
++                             unsigned int syscall_id, uint64_t caller_pc )
+ {
+     uint64_t args[8] = { x0, x1, x2, x3, x4, x5, x6, x7 };
+ 
+@@ -44,6 +44,7 @@ uint64_t wine_nx_do_syscall( uint64_t *stack_args,
+     memcpy( recorded_args, args, sizeof(args) );
+     memcpy( recorded_stack_args, stack_args, sizeof(recorded_stack_args) );
+     recorded_syscall_id = syscall_id;
++    recorded_caller_pc = caller_pc;
+     clobber_vectors();
+     return SYSCALL_RESULT;
+ }
+@@ -116,6 +117,7 @@ static void run_syscall(void)
+             !memcmp( recorded_stack_args, input_stack_args, sizeof(input_stack_args) ) );
+     report( "syscall-nonvolatile-gpr", !memcmp( observed_nonvolatile, input_nonvolatile,
+                                                  sizeof(input_nonvolatile) ) );
++    report( "syscall-diagnostic-caller-pc", recorded_caller_pc == (uint64_t)syscall_return_target );
+     report( "syscall-q6-q15", !memcmp( observed_vec, input_vec, sizeof(input_vec) ) );
+     report( "syscall-authoritative-x18", observed_state[1] == (uint64_t)authoritative_teb &&
+             observed_state[2] == saved_host[0] - 128 );
+diff --git a/horizon-wine/tests/check_callback_lifetime.py b/horizon-wine/tests/check_callback_lifetime.py
+index 99376e8e..2d4bf51e 100644
+--- a/horizon-wine/tests/check_callback_lifetime.py
++++ b/horizon-wine/tests/check_callback_lifetime.py
+@@ -43,8 +43,25 @@ static ULONG_PTR wine_nx_call_pe_callback(void *func, const void *args, ULONG le
+     assert(t == &teb); return ((KERNEL_CALLBACK_PROC)func)((void *)args, len);
+ }
+ '''
++# Include the production value-scope helpers so nonlocal callback attribution is
++# checked against real TLS state, not mocked callback counts.
++horizon = (root / 'dlls/ntdll/unix/horizon.c').read_text()
++def diag_block(signature):
++    start = horizon.index(signature)
++    end, depth = horizon.index('{', start) + 1, 1
++    while depth:
++        depth += (horizon[end] == '{') - (horizon[end] == '}')
++        end += 1
++    return horizon[start:end]
++fixture += '\n#include "' + str(root / 'dlls/ntdll/unix/horizon_suspend_diag.h') + '"\n'
++fixture += 'static __thread struct horizon_diag_scope horizon_diag_current = { .syscall = ~0u };\n'
++fixture += '\n'.join(diag_block(name) for name in ('void horizon_diag_scope_push(', 'void horizon_diag_scope_pop(', 'void horizon_diag_scope_phase('))
++fixture += '\nstatic void horizon_park_if_suspended(void) {}\n'
+ tests = r'''
+ static NTSTATUS mutate(void *args, ULONG len) {
++    struct horizon_diag_scope abandoned;
++    horizon_diag_scope_push(&abandoned, 0x15, 0x9000, 0xa000);
++    horizon_diag_scope_phase(HORIZON_DIAG_HANDLER);
+     assert(len == 64);
+     memset(args, 0x65, len);
+     return NtCallbackReturn(args, len, 0);
+@@ -67,12 +84,17 @@ static void churn_stack(void) {
+     for (unsigned i = 0; i < sizeof(scratch); ++i) scratch[i] = 0xa5;
+ }
+ static void *test_thread(void *unused) {
++    struct horizon_diag_scope outer;
+     (void)unused;
++    horizon_diag_scope_push(&outer, 0x44, 0x1000, 0x2000);
++    horizon_diag_scope_phase(HORIZON_DIAG_HANDLER);
+     for (int round = 0; round < 50; ++round) {
+         unsigned char *original = malloc(64);
+         void *result; ULONG size;
+         memset(original, 0x12, 64);
+         assert(!KeUserModeCallback(0, original, 64, &result, &size));
++        assert(horizon_diag_current.syscall == 0x44 && horizon_diag_current.phase == HORIZON_DIAG_HANDLER);
++        assert(horizon_diag_current.pc == 0x1000 && horizon_diag_current.sp == 0x2000);
+         assert(result != original && size == 64);
+         for (int i = 0; i < 64; ++i) assert(original[i] == 0x12);
+         free(original); churn_stack();
+diff --git a/horizon-wine/tests/check_horizon_suspend.py b/horizon-wine/tests/check_horizon_suspend.py
+index c22fdab9..75508171 100644
+--- a/horizon-wine/tests/check_horizon_suspend.py
++++ b/horizon-wine/tests/check_horizon_suspend.py
+@@ -6,6 +6,8 @@ import subprocess
+ import tempfile
+ from horizon_sync_fixture import legacy_sync_support
+ 
++private_source = (Path(__file__).resolve().parents[2] / "dlls/ntdll/unix/unix_private.h").read_text()
++
+ root = Path(__file__).resolve().parents[2]
+ source = (root / 'dlls/ntdll/unix/horizon.c').read_text()
+ 
+@@ -40,17 +42,21 @@ fixture = r'''
+ #include "winternl.h"
+ #include "wine/server_protocol.h"
+ #include "horizon_threads.h"
++#include "horizon_suspend_diag.h"
+ #define TRACE(...) ((void)0)
+ ''' + definitions + '\n' + structures + r'''
+ struct horizon_server_object {
+     struct horizon_thread_state thread;
++    struct horizon_server_object *thread_next;
+     struct context_data *thread_contexts;
+     unsigned thread_context_count;
+     int thread_context_valid;
++    struct horizon_diag_saved suspend_owner_history, suspend_park_history;
+ };
+-struct horizon_server_connection { int reply_fd; struct horizon_server_object *thread; void *direct_reply; };
++struct horizon_server_connection { int reply_fd; struct horizon_server_object *thread; void *direct_reply; unsigned tid; };
+ struct horizon_user_apc { unsigned size; unsigned char call[HORIZON_APC_CALL_SIZE]; };
+-static struct horizon_server_object target;
++static struct horizon_server_object target, *horizon_server_threads = &target;
++static TEB teb;
+ static pthread_mutex_t horizon_server_objects_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
+ static struct { char reply[64]; _Alignas(8) char data[4096]; unsigned size; } replies[2];
+@@ -86,9 +92,24 @@ static unsigned horizon_server_select_status(const void *r, const void *d, unsig
+ NTSTATUS WINAPI NtQueryPerformanceCounter(LARGE_INTEGER *n, LARGE_INTEGER *p) { (void)p; n->QuadPart = 0; return 0; }
+ NTSTATUS WINAPI NtQuerySystemTime(LARGE_INTEGER *n) { n->QuadPart = 0; return 0; }
+ '''
++# Compile the production TEB extension rather than invent a mismatched doorbell offset.
++fixture += "\n#define __SWITCH__\n#include \"horizon_suspend_diag.h\"\n"
++fixture += block(private_source, 'struct teb_data\n') + ';\n'
++fixture += r'''
++static struct horizon_diag_ring diagnostics;
++#define horizon_suspend_ring diagnostics
++static __thread struct horizon_diag_scope horizon_diag_current = { .syscall = ~0u };
++static unsigned long long armGetSystemTick(void) { return 12345; }
++'''
++fixture += '\n'.join(block(source, name) for name in (
++    'void horizon_diag_scope_push(', 'void horizon_diag_scope_pop(',
++    'void horizon_diag_scope_phase(', 'void horizon_diag_scope_reset(', 'void horizon_diag_record(', 'void horizon_diag_save('))
+ fixture += legacy_sync_support(source)
+ functions = '\n'.join(block(source, name) for name in (
++    'void horizon_server_report_suspended(',
++    'static BOOL horizon_server_has_chpe_doorbell_locked(',
+     'static void horizon_server_set_suspend_doorbell_locked(',
++    'static unsigned int horizon_server_suspend_flags_locked(',
+     'static int horizon_server_handle_resume_thread(',
+     'static int horizon_server_handle_suspend_thread(',
+     'static void horizon_server_merge_context(',
+@@ -96,10 +117,9 @@ functions = '\n'.join(block(source, name) for name in (
+     'static int horizon_server_handle_set_thread_context(',
+     'static int horizon_server_handle_select('))
+ tests = r'''
+-static struct horizon_server_connection control = {0}, client = {1, &target};
++static struct horizon_server_connection control = {.tid = 132}, client = {.reply_fd = 1, .thread = &target, .tid = 4};
+ static ULONG doorbell;
+ static CHPE_V2_CPU_AREA_INFO area;
+-static TEB teb;
+ static NTSTATUS reply_status(void) { return ((struct horizon_server_reply_header *)replies[0].reply)->error; }
+ static void *select_thread(void *arg) {
+     unsigned count = (uintptr_t)arg;
+@@ -124,6 +144,54 @@ static void resume(void) {
+     struct horizon_resume_thread_request request = {.handle = 1};
+     assert(!horizon_server_handle_resume_thread(&control, (void *)&request) && !reply_status());
+ }
++static unsigned durable_owner_lines, durable_park_lines;
++static unsigned expected_owner = 132, expected_old = 0, expected_new = 1, expected_generation_match = 1;
++static unsigned pause_before_select, reached_before_select, release_before_select;
++static void report_history(const char *line) {
++    unsigned tid, caller, handle, old_count, new_count, syscall, phase;
++    unsigned long long pc, sp;
++    if (sscanf(line, "[STALL] suspend-owner tid=%x caller=%x handle=%x old=%u new=%u", &tid, &caller, &handle, &old_count, &new_count) == 5) {
++        assert(tid == 4 && caller == expected_owner && handle == 1 && old_count == expected_old && new_count == expected_new);
++        durable_owner_lines++;
++    }
++    if (sscanf(line, "[STALL] suspend-park tid=%x syscall=%x phase=%u pc=%llx sp=%llx", &tid, &syscall, &phase, &pc, &sp) == 5) {
++        assert(tid == 4 && syscall == 0x34 && phase == HORIZON_DIAG_RETURN);
++        unsigned long long generation, current_generation;
++        unsigned match;
++        const char *generation_text = strstr(line, " generation=");
++        assert(pc == 0x11112222 && sp == 0x33334444);
++        assert(generation_text && sscanf(generation_text, " generation=%llu current_generation=%llu generation_match=%u", &generation, &current_generation, &match) == 3);
++        assert(match == expected_generation_match && match == (generation == current_generation));
++        if (!match) assert(current_generation == generation + 1);
++        durable_park_lines++;
++    }
++    assert(!pthread_mutex_trylock(&horizon_server_objects_mutex));
++    pthread_mutex_unlock(&horizon_server_objects_mutex);
++}
++static int horizon_capture_context(CONTEXT *context) { memset(context, 0, sizeof(*context)); return 0; }
++static void wait_suspend(CONTEXT *context) {
++    (void)context;
++    pthread_mutex_lock(&horizon_server_objects_mutex);
++    if (pause_before_select) {
++        reached_before_select = 1;
++        pthread_cond_broadcast(&changed);
++        while (!release_before_select) pthread_cond_wait(&changed, &horizon_server_objects_mutex);
++    }
++    pthread_mutex_unlock(&horizon_server_objects_mutex);
++    select_thread((void *)2);
++}
++#undef NtCurrentTeb
++#define NtCurrentTeb() (&teb)
++''' + block((root / 'dlls/ntdll/unix/signal_arm64.c').read_text(), 'void horizon_park_if_suspended(') + r'''
++static void *park_target(void *unused) {
++    struct horizon_diag_scope scope;
++    (void)unused;
++    horizon_diag_scope_push(&scope, 0x34, 0x11112222, 0x33334444);
++    horizon_diag_scope_phase(HORIZON_DIAG_RETURN);
++    horizon_park_if_suspended();
++    horizon_diag_scope_pop(&scope);
++    return NULL;
++}
+ int main(void) {
+     pthread_t thread;
+     struct horizon_get_thread_context_request get = {.handle = 1, .machine = IMAGE_FILE_MACHINE_ARM64,
+@@ -131,6 +199,8 @@ int main(void) {
+     struct horizon_set_thread_context_request set = {.handle = 1};
+     struct context_data update = {.machine = IMAGE_FILE_MACHINE_ARM64, .flags = SERVER_CTX_CONTROL};
+     struct context_data *returned;
++    ((struct teb_data *)&teb.GdiTebBatch)->suspend_park_history = &target.suspend_park_history;
++    target.thread.tid = 4;
+     target.thread.started = 1;
+     target.thread.teb = (uintptr_t)&teb;
+     teb.ChpeV2CpuAreaInfo = &area;
+@@ -143,7 +213,9 @@ int main(void) {
+         while (!target.thread_context_valid) pthread_cond_wait(&changed, &horizon_server_objects_mutex);
+         pthread_mutex_unlock(&horizon_server_objects_mutex);
+         assert(!horizon_server_handle_get_thread_context(&control, (void *)&get));
+-        assert(reply_status() == (count ? STATUS_SUCCESS : STATUS_NOT_SUPPORTED));
++        /* Baseline gc-suspension.patch returns success with no matching record.
++         * Preserve that behavior here; diagnostics are not a semantics fix. */
++        assert(reply_status() == STATUS_SUCCESS);
+         if (count) {
+             returned = (void *)replies[0].data;
+             assert(returned->ctl.arm64_regs.pc == 0x12345678);
+@@ -167,7 +239,86 @@ int main(void) {
+     suspend(); resume();
+     select_thread((void *)1);
+     assert(!target.thread_contexts && !target.thread_context_valid);
+-    puts("Horizon suspend: safe-point contexts, nested suspend/resume and unavailable contexts passed");
++    {
++        struct horizon_diag_event events[HORIZON_DIAG_CAPACITY];
++        unsigned count = horizon_diag_ring_snapshot(&diagnostics, events, HORIZON_DIAG_CAPACITY);
++        unsigned suspends = 0, resumes = 0, parks = 0, contexts = 0;
++        for (unsigned i = 0; i < count; i++) {
++            const struct horizon_diag_event *e = &events[i];
++            assert(e->target == 4 || !e->target);
++            if (e->kind == HORIZON_DIAG_SERVER_SUSPEND) {
++                assert(e->caller == 132 && e->target == 4 && e->handle == 1 && !e->status);
++                assert(e->new_count == e->old_count + 1); suspends++;
++            }
++            if (e->kind == HORIZON_DIAG_SERVER_RESUME) {
++                assert(e->caller == 132 && e->target == 4 && e->new_count + 1 == e->old_count); resumes++;
++            }
++            if (e->kind == HORIZON_DIAG_SERVER_PARK) {
++                assert(e->caller == 4 && e->target == 4 && e->flags == 1); parks++;
++            }
++            if (e->kind == HORIZON_DIAG_GET_CONTEXT_RESULT) {
++                assert(e->caller == 132 && e->target == 4 && e->flags == 3); contexts++;
++            }
++        }
++        assert(suspends == 7 && resumes == 7 && parks == 3 && contexts == 3);
++    }
++    /* Real suspend + target/server park paths, followed by far more unrelated
++     * alert records than the entire ring can retain. Durable report must still
++     * identify this target's owner and original syscall/PE location. */
++    teb.ClientId.UniqueThread = (HANDLE)4;
++    teb.ChpeV2CpuAreaInfo = NULL;
++    suspend();
++    assert(!pthread_create(&thread, NULL, park_target, NULL));
++    pthread_mutex_lock(&horizon_server_objects_mutex);
++    while (!target.thread_context_valid) pthread_cond_wait(&changed, &horizon_server_objects_mutex);
++    pthread_mutex_unlock(&horizon_server_objects_mutex);
++    for (unsigned i = 0; i < HORIZON_DIAG_CAPACITY * 4 + 13; i++)
++        horizon_diag_emit(HORIZON_DIAG_ALERT, 8, 12, 0, 0, 0, 0, 0x1234, i, 0);
++    horizon_server_report_suspended(report_history);
++    assert(durable_owner_lines == 1 && durable_park_lines == 1);
++    resume();
++    assert(!pthread_join(thread, NULL));
++    /* Deterministic gap: target has saved its PE location but has not sent
++     * server_select. Resume/re-suspend must retain that payload and explicitly
++     * label its earlier generation, never let a server clear race its writer. */
++    pause_before_select = 1;
++    suspend();
++    assert(!pthread_create(&thread, NULL, park_target, NULL));
++    pthread_mutex_lock(&horizon_server_objects_mutex);
++    while (!reached_before_select) pthread_cond_wait(&changed, &horizon_server_objects_mutex);
++    pthread_mutex_unlock(&horizon_server_objects_mutex);
++    resume(); suspend();
++    pthread_mutex_lock(&horizon_server_objects_mutex);
++    release_before_select = 1;
++    pthread_cond_broadcast(&changed);
++    while (!target.thread_context_valid) pthread_cond_wait(&changed, &horizon_server_objects_mutex);
++    pthread_mutex_unlock(&horizon_server_objects_mutex);
++    for (unsigned i = 0; i < HORIZON_DIAG_CAPACITY * 4 + 13; i++)
++        horizon_diag_emit(HORIZON_DIAG_ALERT, 8, 12, 0, 0, 0, 0, 0x1234, i, 0);
++    expected_generation_match = 0;
++    durable_owner_lines = durable_park_lines = 0;
++    horizon_server_report_suspended(report_history);
++    assert(durable_owner_lines == 1 && durable_park_lines == 1);
++    /* Nested successful suspend replaces only owner history. A failed
++     * suspension must not overwrite that last successful transition. */
++    control.tid = expected_owner = 140;
++    expected_old = 1; expected_new = 2;
++    suspend();
++    durable_owner_lines = durable_park_lines = 0;
++    horizon_server_report_suspended(report_history);
++    assert(durable_owner_lines == 1 && durable_park_lines == 1);
++    {
++        struct horizon_suspend_thread_request invalid = {.handle = 2};
++        control.tid = 200;
++        assert(!horizon_server_handle_suspend_thread(&control, (void *)&invalid));
++        assert(reply_status() == STATUS_INVALID_HANDLE);
++    }
++    durable_owner_lines = durable_park_lines = 0;
++    horizon_server_report_suspended(report_history);
++    assert(durable_owner_lines == 1 && durable_park_lines == 1);
++    resume(); resume();
++    assert(!pthread_join(thread, NULL));
++    puts("Horizon suspend: nested counts, handoff, numeric owner diagnostics and durable wraparound history passed");
+ }
+ '''
+ 
+diff --git a/horizon-wine/tests/check_select_wait.py b/horizon-wine/tests/check_select_wait.py
+index c7d00dbb..ec8cbb9b 100644
+--- a/horizon-wine/tests/check_select_wait.py
++++ b/horizon-wine/tests/check_select_wait.py
+@@ -9,6 +9,7 @@ def extract(start, end):
+     return source[source.index(start):source.index(end, source.index(start))]
+ fixture = r'''
+ #define HORIZON_STANDALONE_SYNTAX
++volatile int wine_nx_quit_requested;
+ #include <assert.h>
+ #include <errno.h>
+ #include <stddef.h>
+diff --git a/dlls/ntdll/unix/horizon_suspend_diag.h b/dlls/ntdll/unix/horizon_suspend_diag.h
+new file mode 100644
+index 00000000..79c0e81b
+--- /dev/null
++++ b/dlls/ntdll/unix/horizon_suspend_diag.h
+@@ -0,0 +1,136 @@
++/* Bounded numeric suspension diagnostics; LGPL-2.1-or-later. */
++#ifndef HORIZON_SUSPEND_DIAG_H
++#define HORIZON_SUSPEND_DIAG_H
++#include <stdint.h>
++#ifndef HORIZON_DIAG_CAPACITY
++#define HORIZON_DIAG_CAPACITY 2048
++#endif
++struct horizon_diag_event
++{
++    uint64_t sequence, timestamp, handle, address, pc, sp;
++    uint32_t kind, caller, target, old_count, new_count, status, syscall, phase, value, flags;
++};
++/* Durable per-target history. Owner updates are serialized by the server's
++ * existing object mutex; park updates have one writer, the target thread.
++ * Readers never acquire a writer lock or prevent publication. */
++struct horizon_diag_saved { uint64_t version, generation; struct horizon_diag_event event; };
++#define HORIZON_DIAG_FIELDS(X) \
++    X(sequence) X(timestamp) X(handle) X(address) X(pc) X(sp) \
++    X(kind) X(caller) X(target) X(old_count) X(new_count) X(status) X(syscall) X(phase) X(value) X(flags)
++static inline void horizon_diag_saved_write(struct horizon_diag_saved *saved, const struct horizon_diag_event *event)
++{
++    uint64_t version = __atomic_fetch_add(&saved->version, 1, __ATOMIC_ACQ_REL);
++#define STORE_FIELD(name) __atomic_store_n(&saved->event.name, event->name, __ATOMIC_RELAXED);
++    HORIZON_DIAG_FIELDS(STORE_FIELD)
++#undef STORE_FIELD
++    __atomic_store_n(&saved->event.sequence, version / 2 + 1, __ATOMIC_RELAXED);
++    __atomic_fetch_add(&saved->version, 1, __ATOMIC_RELEASE);
++}
++static inline int horizon_diag_saved_read(const struct horizon_diag_saved *saved, struct horizon_diag_event *out)
++{
++    uint64_t before = __atomic_load_n(&saved->version, __ATOMIC_ACQUIRE);
++    if (!before || (before & 1)) return 0;
++#define LOAD_FIELD(name) out->name = __atomic_load_n(&saved->event.name, __ATOMIC_RELAXED);
++    HORIZON_DIAG_FIELDS(LOAD_FIELD)
++#undef LOAD_FIELD
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    return __atomic_load_n(&saved->version, __ATOMIC_RELAXED) == before && out->kind;
++}
++static inline void horizon_diag_saved_clear(struct horizon_diag_saved *saved)
++{
++    const struct horizon_diag_event empty = {0};
++    horizon_diag_saved_write(saved, &empty);
++}
++#undef HORIZON_DIAG_FIELDS
++enum horizon_diag_kind
++{
++    HORIZON_DIAG_SUSPEND_ENTER = 1, HORIZON_DIAG_BACKEND_ENTER, HORIZON_DIAG_BACKEND_EXIT,
++    HORIZON_DIAG_SUSPEND_EXIT, HORIZON_DIAG_SERVER_SUSPEND, HORIZON_DIAG_SERVER_RESUME,
++    HORIZON_DIAG_GET_CONTEXT, HORIZON_DIAG_GET_CONTEXT_RESULT,
++    HORIZON_DIAG_SET_CONTEXT, HORIZON_DIAG_SET_CONTEXT_RESULT,
++    HORIZON_DIAG_PARK_ENTER, HORIZON_DIAG_PARK_EXIT,
++    HORIZON_DIAG_WAIT_ALERT, HORIZON_DIAG_WAIT_ALERT_RESULT, HORIZON_DIAG_ALERT,
++    HORIZON_DIAG_SERVER_PARK, HORIZON_DIAG_SERVER_UNPARK
++};
++enum horizon_diag_phase { HORIZON_DIAG_ENTRY = 1, HORIZON_DIAG_HANDLER, HORIZON_DIAG_RETURN };
++struct horizon_diag_scope
++{
++    uint64_t pc, sp;
++    uint32_t syscall, phase;
++};
++/* Weak so standalone ntdll extraction/smoke programs need no recorder. */
++#ifdef __APPLE__
++#define HORIZON_DIAG_WEAK __attribute__((weak_import))
++#else
++#define HORIZON_DIAG_WEAK __attribute__((weak))
++#endif
++extern void horizon_diag_record(const struct horizon_diag_event *) HORIZON_DIAG_WEAK;
++extern void horizon_diag_save(struct horizon_diag_saved *, const struct horizon_diag_event *) HORIZON_DIAG_WEAK;
++extern void horizon_diag_scope_push(struct horizon_diag_scope *, uint32_t, uint64_t, uint64_t) HORIZON_DIAG_WEAK;
++extern void horizon_diag_scope_pop(struct horizon_diag_scope *) HORIZON_DIAG_WEAK;
++extern void horizon_diag_scope_phase(uint32_t) HORIZON_DIAG_WEAK;
++extern void horizon_diag_scope_reset(void) HORIZON_DIAG_WEAK;
++static inline void horizon_diag_emit_saved(struct horizon_diag_saved *saved, uint32_t kind, uint32_t caller, uint32_t target,
++                                     uint64_t handle, uint32_t old_count, uint32_t new_count,
++                                     uint32_t status, uint64_t address, uint32_t value, uint32_t flags)
++{
++    struct horizon_diag_event event = {0};
++    if (!horizon_diag_record && !horizon_diag_save) return;
++    event.kind = kind; event.caller = caller; event.target = target; event.handle = handle;
++    event.old_count = old_count; event.new_count = new_count; event.status = status;
++    event.address = address; event.value = value; event.flags = flags;
++    if (horizon_diag_record) horizon_diag_record(&event);
++    if (saved && horizon_diag_save) horizon_diag_save(saved, &event);
++}
++static inline void horizon_diag_emit(uint32_t kind, uint32_t caller, uint32_t target,
++                                     uint64_t handle, uint32_t old_count, uint32_t new_count,
++                                     uint32_t status, uint64_t address, uint32_t value, uint32_t flags)
++{
++    horizon_diag_emit_saved(0, kind, caller, target, handle, old_count, new_count, status, address, value, flags);
++}
++struct horizon_diag_slot { unsigned guard; struct horizon_diag_event event; };
++struct horizon_diag_ring { uint64_t sequence, dropped; struct horizon_diag_slot slots[HORIZON_DIAG_CAPACITY]; };
++/* Each guard is a try-lock: diagnostics must never wait for a paused writer.
++ * All event bytes are copied under this guard, including by readers. */
++static inline void horizon_diag_ring_write(struct horizon_diag_ring *ring, const struct horizon_diag_event *event)
++{
++    uint64_t sequence = __atomic_add_fetch(&ring->sequence, 1, __ATOMIC_RELAXED);
++    struct horizon_diag_slot *slot = &ring->slots[(sequence - 1) % HORIZON_DIAG_CAPACITY];
++    if (__atomic_exchange_n(&slot->guard, 1, __ATOMIC_ACQUIRE))
++    {
++        __atomic_add_fetch(&ring->dropped, 1, __ATOMIC_RELAXED);
++        return;
++    }
++    /* A writer may have been descheduled before claiming its slot. Never let
++     * that old reservation replace a newer event after wraparound. */
++    if (slot->event.sequence < sequence)
++    {
++        slot->event = *event;
++        slot->event.sequence = sequence;
++    }
++    else __atomic_add_fetch(&ring->dropped, 1, __ATOMIC_RELAXED);
++    __atomic_store_n(&slot->guard, 0, __ATOMIC_RELEASE);
++}
++static inline int horizon_diag_ring_read(struct horizon_diag_ring *ring, uint64_t sequence,
++                                          struct horizon_diag_event *out)
++{
++    struct horizon_diag_slot *slot = &ring->slots[(sequence - 1) % HORIZON_DIAG_CAPACITY];
++    int found;
++    if (__atomic_exchange_n(&slot->guard, 1, __ATOMIC_ACQUIRE)) return 0;
++    found = slot->event.sequence == sequence;
++    if (found) *out = slot->event;
++    __atomic_store_n(&slot->guard, 0, __ATOMIC_RELEASE);
++    return found;
++}
++static inline unsigned horizon_diag_ring_snapshot(struct horizon_diag_ring *ring, struct horizon_diag_event *out, unsigned capacity)
++{
++    uint64_t end = __atomic_load_n(&ring->sequence, __ATOMIC_RELAXED), start;
++    unsigned count = 0;
++    if (!out || !capacity) return 0;
++    if (capacity > HORIZON_DIAG_CAPACITY) capacity = HORIZON_DIAG_CAPACITY;
++    start = end > capacity ? end - capacity + 1 : 1;
++    for (uint64_t sequence = start; sequence <= end; sequence++)
++        if (horizon_diag_ring_read(ring, sequence, &out[count])) count++;
++    return count;
++}
++#endif
+diff --git a/horizon-wine/tests/suspend_diag.c b/horizon-wine/tests/suspend_diag.c
+new file mode 100644
+index 00000000..e795571d
+--- /dev/null
++++ b/horizon-wine/tests/suspend_diag.c
+@@ -0,0 +1,123 @@
++/* Numeric publication, overflow and bounded-progress regression for the real ring. */
++#include <assert.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#define HORIZON_DIAG_CAPACITY 32
++#include "horizon_suspend_diag.h"
++static struct horizon_diag_ring ring;
++static unsigned done;
++static struct horizon_diag_event event(unsigned value)
++{
++    struct horizon_diag_event e = {0};
++    e.timestamp = (uint64_t)value * 17;
++    e.caller = value; e.target = value ^ 0x55aa;
++    e.handle = (uint64_t)value * 3; e.address = ~e.handle;
++    e.status = value ^ 0x1234; e.old_count = value + 7; e.new_count = value + 8;
++    e.kind = 9; e.syscall = value + 11; e.phase = 3; e.value = value + 13;
++    return e;
++}
++static void valid(const struct horizon_diag_event *e)
++{
++    unsigned v = e->caller;
++    assert(e->sequence && e->timestamp == (uint64_t)v * 17);
++    assert(e->target == (v ^ 0x55aa) && e->handle == (uint64_t)v * 3);
++    assert(e->address == ~e->handle && e->status == (v ^ 0x1234));
++    assert(e->old_count == v + 7 && e->new_count == v + 8);
++    assert(e->kind == 9 && e->syscall == v + 11 && e->phase == 3 && e->value == v + 13);
++}
++static void wrap_and_bounds(void)
++{
++    struct { uint64_t before; struct horizon_diag_event out[7]; uint64_t after; } guarded;
++    struct horizon_diag_event all[HORIZON_DIAG_CAPACITY];
++    unsigned n;
++    for (unsigned i = 1; i <= 96; i++) { struct horizon_diag_event e = event(i); horizon_diag_ring_write(&ring, &e); }
++    n = horizon_diag_ring_snapshot(&ring, all, HORIZON_DIAG_CAPACITY);
++    assert(n == HORIZON_DIAG_CAPACITY);
++    for (unsigned i = 0; i < n; i++) { valid(&all[i]); assert(all[i].sequence == i + 65 && all[i].caller == i + 65); }
++    guarded.before = 0x87654321; guarded.after = 0x12345678;
++    n = horizon_diag_ring_snapshot(&ring, guarded.out, 7);
++    assert(n == 7 && guarded.before == 0x87654321 && guarded.after == 0x12345678);
++    for (unsigned i = 0; i < n; i++) assert(guarded.out[i].sequence == i + 90);
++    assert(!horizon_diag_ring_snapshot(&ring, NULL, 0));
++    assert(!horizon_diag_ring_snapshot(&ring, NULL, 10));
++}
++static void busy_slot_never_waits(void)
++{
++    struct horizon_diag_event e = event(99), out[HORIZON_DIAG_CAPACITY];
++    uint64_t next = ring.sequence + 1, dropped = ring.dropped;
++    unsigned index = (unsigned)((next - 1) % HORIZON_DIAG_CAPACITY);
++    __atomic_store_n(&ring.slots[index].guard, 1, __ATOMIC_RELEASE);
++    horizon_diag_ring_write(&ring, &e);
++    assert(ring.sequence == next && ring.dropped == dropped + 1);
++    assert(horizon_diag_ring_snapshot(&ring, out, HORIZON_DIAG_CAPACITY) <= HORIZON_DIAG_CAPACITY - 1);
++    __atomic_store_n(&ring.slots[index].guard, 0, __ATOMIC_RELEASE);
++}
++static void *writer(void *arg)
++{
++    unsigned base = (unsigned)(uintptr_t)arg;
++    for (unsigned i = 0; i < 25000; i++) { struct horizon_diag_event e = event(base + i); horizon_diag_ring_write(&ring, &e); }
++    __atomic_add_fetch(&done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++static void concurrent_publication(void)
++{
++    pthread_t threads[4];
++    struct horizon_diag_event out[13];
++    uint64_t before = ring.sequence;
++    unsigned snapshots = 0;
++    for (unsigned i = 0; i < 4; i++) assert(!pthread_create(&threads[i], NULL, writer, (void *)(uintptr_t)(100000 * (i + 1))));
++    do {
++        unsigned n = horizon_diag_ring_snapshot(&ring, out, 13);
++        assert(n <= 13);
++        for (unsigned i = 0; i < n; i++) { valid(&out[i]); if(i) assert(out[i].sequence > out[i-1].sequence); }
++        snapshots++;
++    } while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) != 4);
++    for (unsigned i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
++    assert(ring.sequence == before + 100000 && snapshots);
++}
++static struct horizon_diag_saved saved;
++static void *durable_writer(void *unused)
++{
++    (void)unused;
++    for (unsigned i = 1; i <= 100000; i++) {
++        struct horizon_diag_event e = event(i);
++        horizon_diag_saved_write(&saved, &e);
++    }
++    __atomic_add_fetch(&done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++static void *generation_controller(void *unused)
++{
++    (void)unused;
++    for (unsigned i = 0; i < 100000; i++) __atomic_add_fetch(&saved.generation, 1, __ATOMIC_RELEASE);
++    __atomic_add_fetch(&done, 1, __ATOMIC_RELEASE);
++    return NULL;
++}
++static void durable_publication(void)
++{
++    pthread_t thread, controller;
++    struct horizon_diag_event out;
++    assert(!horizon_diag_saved_read(&saved, &out));
++    done = 0;
++    assert(!pthread_create(&thread, NULL, durable_writer, NULL));
++    assert(!pthread_create(&controller, NULL, generation_controller, NULL));
++    do { if (horizon_diag_saved_read(&saved, &out)) valid(&out); }
++    while (__atomic_load_n(&done, __ATOMIC_ACQUIRE) != 2);
++    assert(!pthread_join(thread, NULL));
++    assert(!pthread_join(controller, NULL));
++    assert(saved.generation == 100000);
++    assert(horizon_diag_saved_read(&saved, &out)); valid(&out);
++    assert(out.caller == 100000 && out.sequence == 100000);
++    horizon_diag_saved_clear(&saved);
++    assert(!horizon_diag_saved_read(&saved, &out));
++    /* A writer in publication never blocks the snapshot reader. */
++    __atomic_store_n(&saved.version, 3, __ATOMIC_RELEASE);
++    assert(!horizon_diag_saved_read(&saved, &out));
++}
++int main(void)
++{
++    wrap_and_bounds(); busy_slot_never_waits(); concurrent_publication(); durable_publication();
++    printf("suspend diagnostics: wraparound, bounded snapshot, busy-slot drop 100000 concurrent ring publications and durable atomic snapshots passed\n");
++}
+diff --git a/horizon-wine/tests/check_suspend_diagnostics.py b/horizon-wine/tests/check_suspend_diagnostics.py
+new file mode 100644
+index 00000000..686d09fd
+--- /dev/null
++++ b/horizon-wine/tests/check_suspend_diagnostics.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Host tests of the real bounded ring, recorder scopes and callback boundaries."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++
++root = Path(__file__).resolve().parents[2]
++source = (root / 'dlls/ntdll/unix/horizon.c').read_text()
++
++def block(signature):
++    start = source.index(signature)
++    end = source.index('{', start) + 1
++    depth = 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++
++# RED is a runtime numeric-content assertion for the ring test, while recorder
++# tests compile production functions after they are introduced.
++with tempfile.TemporaryDirectory(prefix='suspend-diag-') as directory:
++    build = Path(directory)
++    cc = os.environ.get('WINE_NX_HOST_CC', '/usr/bin/clang')
++    options = ['-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread',
++               '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
++               '-I' + str(root / 'dlls/ntdll/unix')]
++    subprocess.run([cc, *options, str(root / 'horizon-wine/tests/suspend_diag.c'), '-o', str(build / 'ring')], check=True)
++    subprocess.run([str(build / 'ring')], check=True, timeout=30)
++    subprocess.run([cc, *[x for x in options if not x.startswith('-fsanitize=')], '-fsanitize=thread',
++                    str(root / 'horizon-wine/tests/suspend_diag.c'), '-o', str(build / 'ring-tsan')], check=True)
++    subprocess.run([str(build / 'ring-tsan')], check=True, timeout=30)
++    fixture = r'''
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++#include "horizon_suspend_diag.h"
++static struct horizon_diag_ring horizon_suspend_ring;
++static __thread struct horizon_diag_scope horizon_diag_current = { .syscall = ~0u };
++static unsigned long long armGetSystemTick(void) { return 12345678; }
++'''
++    names = ('void horizon_diag_scope_push(', 'void horizon_diag_scope_pop(',
++             'void horizon_diag_scope_phase(', 'void horizon_diag_scope_reset(',
++             'void horizon_diag_record(', 'void horizon_diag_save(', 'void horizon_suspend_diag_dump(')
++    if not all(name in source for name in names):
++        raise AssertionError('production recorder/dump not implemented')
++    fixture += '\n'.join(block(name) for name in names)
++    fixture += r'''
++static unsigned callbacks, records;
++static void output(const char *line)
++{
++    unsigned long long sequence, ticks, handle, address, pc, sp;
++    unsigned kind, caller, target, old_count, new_count, status, syscall, phase, value, flags;
++    /* Every slot is available before callback execution. The callback may
++     * record new events without deadlocking or corrupting the dump. */
++    for (unsigned i = 0; i < HORIZON_DIAG_CAPACITY; i++) assert(!horizon_suspend_ring.slots[i].guard);
++    callbacks++;
++    if (sscanf(line, "[SUSPEND-DIAG] seq=%llu tick=%llu event=%u caller=%x target=%x handle=%llx old=%u new=%u status=%x syscall=%x phase=%u pc=%llx sp=%llx addr=%llx value=%x flags=%x",
++               &sequence, &ticks, &kind, &caller, &target, &handle, &old_count, &new_count,
++               &status, &syscall, &phase, &pc, &sp, &address, &value, &flags) == 16)
++    {
++        assert(sequence && ticks == 12345678 && caller == 4 && target == 132);
++        assert(handle == 0x88 && address == 0x12345678);
++        assert(old_count == 2 && new_count == 3 && status == 0x123);
++        assert(syscall == (records == 1 ? 0x66 : 0x44));
++        assert(pc == (records == 1 ? 0x2000 : 0x1000));
++        assert(sp == (records == 1 ? 0x4000 : 0x3000));
++        assert(phase == (records == 1 ? HORIZON_DIAG_HANDLER : HORIZON_DIAG_RETURN));
++        assert(value == 7 && flags == 9 && kind == HORIZON_DIAG_PARK_ENTER);
++        records++;
++    }
++    else assert(strstr(line, "[SUSPEND-DIAG] end="));
++    {
++        struct horizon_diag_event extra = {0};
++        horizon_diag_ring_write(&horizon_suspend_ring, &extra);
++    }
++}
++static void nested_scopes(void)
++{
++    struct horizon_diag_scope outer = {0}, inner = {0};
++    horizon_diag_scope_push(&outer, 0x44, 0x1000, 0x3000);
++    horizon_diag_scope_phase(HORIZON_DIAG_RETURN);
++    horizon_diag_emit(HORIZON_DIAG_PARK_ENTER, 4, 132, 0x88, 2, 3, 0x123, 0x12345678, 7, 9);
++    horizon_diag_scope_push(&inner, 0x66, 0x2000, 0x4000);
++    horizon_diag_scope_phase(HORIZON_DIAG_HANDLER);
++    horizon_diag_emit(HORIZON_DIAG_PARK_ENTER, 4, 132, 0x88, 2, 3, 0x123, 0x12345678, 7, 9);
++    horizon_diag_scope_pop(&inner);
++    horizon_diag_emit(HORIZON_DIAG_PARK_ENTER, 4, 132, 0x88, 2, 3, 0x123, 0x12345678, 7, 9);
++    horizon_diag_scope_pop(&outer);
++    assert(horizon_diag_current.syscall == ~0u && !horizon_diag_current.phase);
++    horizon_suspend_diag_dump(output);
++    assert(records == 3 && callbacks == 4 && horizon_suspend_ring.sequence == 7);
++}
++int main(void)
++{
++    nested_scopes();
++    callbacks = records = 0;
++    memset(&horizon_suspend_ring, 0, sizeof(horizon_suspend_ring));
++    horizon_suspend_diag_dump(output);
++    assert(callbacks == 1 && !records);
++    puts("suspend diagnostics: numeric dump, nested syscall restoration and callback lock boundaries passed");
++}
++'''
++    (build / 'recorder.c').write_text(fixture)
++    subprocess.run([cc, *options, str(build / 'recorder.c'), '-o', str(build / 'recorder')], check=True)
++    subprocess.run([str(build / 'recorder')], check=True, timeout=30)
+diff --git a/horizon-wine/tests/check_suspend_diag_alerts.py b/horizon-wine/tests/check_suspend_diag_alerts.py
+new file mode 100644
+index 00000000..72b29209
+--- /dev/null
++++ b/horizon-wine/tests/check_suspend_diag_alerts.py
+@@ -0,0 +1,119 @@
++#!/usr/bin/env python3
++"""Run real NtAlert/WaitForAlert paths and inspect emitted numeric records."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++root = Path(__file__).resolve().parents[2]
++source = (root / 'dlls/ntdll/unix/sync.c').read_text()
++def block(signature):
++    start = source.index(signature)
++    end, depth = source.index('{', start) + 1, 1
++    while depth:
++        depth += (source[end] == '{') - (source[end] == '}')
++        end += 1
++    return source[start:end]
++fixture = r'''
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <time.h>
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "horizon_suspend_diag.h"
++#define USE_FUTEX
++#define __SWITCH__
++#define TRACE(...) ((void)0)
++#define TICKSPERSEC 10000000
++#define TIMEOUT_INFINITE 0x7fffffffffffffffLL
++static __thread TEB teb;
++#undef NtCurrentTeb
++#define NtCurrentTeb() (&teb)
++struct thread_data { unsigned tid; };
++static __thread struct thread_data thread_data;
++static struct thread_data *get_thread_data(void) { return &thread_data; }
++union tid_alert_entry { LONG futex; };
++static union tid_alert_entry entries[8];
++static union tid_alert_entry *get_tid_alert_entry(HANDLE tid) { unsigned n = HandleToULong(tid); return n < 8 ? &entries[n] : NULL; }
++static struct horizon_diag_ring diagnostics;
++void horizon_diag_record(const struct horizon_diag_event *event) { horizon_diag_ring_write(&diagnostics, event); }
++/* The OS address-wait stand-in provides actual pthread synchronization; the
++ * NtAlert/Wait functions and diagnostic records under test are production code. */
++static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
++static unsigned waiting;
++static int futex_wait(const LONG *addr, int value, struct timespec *timeout)
++{
++    int result = 0;
++    pthread_mutex_lock(&mutex);
++    waiting++;
++    pthread_cond_broadcast(&changed);
++    if (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == value) {
++        if (timeout) { struct timespec now; clock_gettime(CLOCK_REALTIME, &now); result = pthread_cond_timedwait(&changed, &mutex, &now); }
++        else while (__atomic_load_n(addr, __ATOMIC_ACQUIRE) == value) pthread_cond_wait(&changed, &mutex);
++    }
++    pthread_mutex_unlock(&mutex);
++    if (result) { errno = result; return -1; }
++    return 0;
++}
++static int futex_wake_one(const LONG *addr)
++{
++    (void)addr; pthread_mutex_lock(&mutex); pthread_cond_broadcast(&changed); pthread_mutex_unlock(&mutex); return 0;
++}
++static LONGLONG get_absolute_timeout(const LARGE_INTEGER *timeout) { return timeout->QuadPart; }
++static LONGLONG update_timeout(ULONGLONG end) { (void)end; return 0; }
++'''
++fixture += block('NTSTATUS WINAPI NtAlertThreadByThreadId(') + '\n' + block('NTSTATUS WINAPI NtWaitForAlertByThreadId(')
++fixture += r'''
++static void *waiter(void *unused)
++{
++    (void)unused;
++    thread_data.tid = 4; teb.ClientId.UniqueThread = (HANDLE)4;
++    assert(NtWaitForAlertByThreadId((void *)0x112233, NULL) == STATUS_ALERTED);
++    return NULL;
++}
++int main(void)
++{
++    pthread_t thread;
++    struct horizon_diag_event events[16];
++    unsigned count, began = 0, ended = 0, woke = 0;
++    teb.ClientId.UniqueThread = (HANDLE)7;
++    assert(!pthread_create(&thread, NULL, waiter, NULL));
++    pthread_mutex_lock(&mutex);
++    while (!waiting) pthread_cond_wait(&changed, &mutex);
++    pthread_mutex_unlock(&mutex);
++    assert(!NtAlertThreadByThreadId((HANDLE)4));
++    assert(!pthread_join(thread, NULL));
++    count = horizon_diag_ring_snapshot(&diagnostics, events, 16);
++    assert(count == 3);
++    for (unsigned i = 0; i < count; i++) {
++        struct horizon_diag_event *e = &events[i];
++        assert(e->target == 4 && e->address == (uintptr_t)&entries[4].futex);
++        if (e->kind == HORIZON_DIAG_WAIT_ALERT) { assert(e->caller == 4 && e->handle == 0x112233 && !e->value); began++; }
++        else if (e->kind == HORIZON_DIAG_WAIT_ALERT_RESULT) { assert(e->caller == 4 && e->status == STATUS_ALERTED); ended++; }
++        else if (e->kind == HORIZON_DIAG_ALERT) { assert(e->caller == 7 && !e->value && !e->status); woke++; }
++        else assert(0);
++    }
++    assert(began == 1 && ended == 1 && woke == 1);
++    thread_data.tid = 4; teb.ClientId.UniqueThread = (HANDLE)4;
++    { LARGE_INTEGER timeout = { .QuadPart = 0 }; assert(NtWaitForAlertByThreadId((void *)0x556677, &timeout) == STATUS_TIMEOUT); }
++    count = horizon_diag_ring_snapshot(&diagnostics, events, 16);
++    assert(count == 5 && events[4].kind == HORIZON_DIAG_WAIT_ALERT_RESULT && events[4].status == STATUS_TIMEOUT);
++    assert(events[3].handle == 0x556677 && events[3].flags == 1);
++    assert(NtAlertThreadByThreadId((HANDLE)99) == STATUS_INVALID_CID);
++    puts("suspend diagnostics: real alert wait/wake, caller/recipient/address and timeout records passed");
++}
++'''
++with tempfile.TemporaryDirectory(prefix='suspend-alerts-') as directory:
++    path = Path(directory)
++    (path / 'test.c').write_text(fixture)
++    subprocess.run([os.environ.get('WINE_NX_HOST_CC', '/usr/bin/clang'), '-std=gnu11', '-g', '-O1',
++                    '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
++                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-pthread', '-D__WINESRC__', '-D_WIN64',
++                    '-I' + str(root / 'include'), '-I' + str(root / 'dlls/ntdll/unix'),
++                    str(path / 'test.c'), '-o', str(path / 'test')], check=True)
++    subprocess.run([str(path / 'test')], check=True, timeout=30)
+diff --git a/horizon-wine/tests/check_suspend_diag_dispatch.py b/horizon-wine/tests/check_suspend_diag_dispatch.py
+new file mode 100644
+index 00000000..9a0959c5
+--- /dev/null
++++ b/horizon-wine/tests/check_suspend_diag_dispatch.py
+@@ -0,0 +1,106 @@
++#!/usr/bin/env python3
++"""Compile production C dispatcher and inspect nested syscall event attribution."""
++from pathlib import Path
++import os
++import subprocess
++import tempfile
++root = Path(__file__).resolve().parents[2]
++source = (root / 'dlls/ntdll/unix/signal_arm64.c').read_text()
++horizon = (root / 'dlls/ntdll/unix/horizon.c').read_text()
++def block(text, signature):
++    start = text.index(signature)
++    end, depth = text.index('{', start) + 1, 1
++    while depth:
++        depth += (text[end] == '{') - (text[end] == '}')
++        end += 1
++    return text[start:end]
++fixture = r'''
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include "ntstatus.h"
++#define WIN32_NO_STATUS
++#include "windef.h"
++#include "winternl.h"
++#include "horizon_suspend_diag.h"
++#define __SWITCH__
++static struct horizon_diag_ring horizon_suspend_ring;
++static __thread struct horizon_diag_scope horizon_diag_current = { .syscall = ~0u };
++static unsigned long long armGetSystemTick(void) { return 12345; }
++'''
++fixture += '\n'.join(block(horizon, name) for name in ('void horizon_diag_scope_push(', 'void horizon_diag_scope_pop(',
++                       'void horizon_diag_scope_phase(', 'void horizon_diag_scope_reset(', 'void horizon_diag_record(', 'void horizon_diag_save('))
++fixture += r'''
++static TEB teb;
++#undef NtCurrentTeb
++#define NtCurrentTeb() (&teb)
++volatile int wine_nx_quit_requested;
++void wine_nx_quit_point(void) __attribute__((weak));
++void wine_nx_quit_point(void) {}
++int wine_nx_runtime_verbose __attribute__((weak));
++void wine_nx_runtime_trace(const char *line) { (void)line; assert(0); }
++static SYSTEM_SERVICE_TABLE KeServiceDescriptorTable[4];
++static unsigned int wine_nx_syscalls, wine_nx_syscall_counts[0x2000];
++static __thread unsigned int wine_nx_syscall_sample;
++NTSTATUS WINAPI NtReadVirtualMemory(HANDLE h, const void *a, void *b, SIZE_T n, SIZE_T *done)
++{ (void)h; (void)a; (void)b; (void)n; (void)done; return 0; }
++/* Suspension-consumer stand-in exercises the production dispatcher's entry
++ * and exit attribution without changing suspension behavior or claiming a park. */
++static void horizon_park_if_suspended(void)
++{ horizon_diag_emit(HORIZON_DIAG_PARK_ENTER, 4, 4, 0, 0, 0, 0, 0, 0, 0); }
++'''
++fixture += block(source, 'ULONG_PTR wine_nx_do_syscall(')
++fixture += r'''
++static ULONG_PTR inner(ULONG_PTR a, ULONG_PTR b, ULONG_PTR c, ULONG_PTR d,
++                       ULONG_PTR e, ULONG_PTR f, ULONG_PTR g, ULONG_PTR h)
++{
++    assert(a == 10 && b == 20 && c == 30 && d == 40 && e == 50 && f == 60 && g == 70 && h == 80);
++    horizon_diag_emit(HORIZON_DIAG_GET_CONTEXT, 4, 8, 0x99, 0, 0, 0, 0, 0, 0);
++    return 0x8877665544332211ULL;
++}
++static ULONG_PTR outer(ULONG_PTR a, ULONG_PTR b, ULONG_PTR c, ULONG_PTR d,
++                       ULONG_PTR e, ULONG_PTR f, ULONG_PTR g, ULONG_PTR h)
++{
++    ULONG_PTR result;
++    assert(a == 1 && b == 2 && c == 3 && d == 4 && e == 5 && f == 6 && g == 7 && h == 8);
++    result = wine_nx_do_syscall((ULONG_PTR *)0x4000, 10,20,30,40,50,60,70,80, 1, 0x2000);
++    horizon_diag_emit(HORIZON_DIAG_GET_CONTEXT, 4, 12, 0x88, 0, 0, 0, 0, 0, 0);
++    return result;
++}
++int main(void)
++{
++    ULONG_PTR services[] = {(ULONG_PTR)outer, (ULONG_PTR)inner, 0};
++    BYTE bytes[] = {64,64,64};
++    struct horizon_diag_event events[16];
++    unsigned n;
++    KeServiceDescriptorTable[0] = (SYSTEM_SERVICE_TABLE){services, NULL, 3, bytes};
++    assert(wine_nx_do_syscall((ULONG_PTR *)0x3000,1,2,3,4,5,6,7,8,0,0x1000) == 0x8877665544332211ULL);
++    assert(horizon_diag_current.syscall == ~0u);
++    n = horizon_diag_ring_snapshot(&horizon_suspend_ring, events, 16);
++    assert(n == 6);
++    for (unsigned i = 0; i < n; i++) {
++        int nested = i >= 1 && i <= 3;
++        assert(events[i].syscall == (unsigned)nested);
++        assert(events[i].pc == (nested ? 0x2000 : 0x1000));
++        assert(events[i].sp == (nested ? 0x4000 : 0x3000));
++    }
++    assert(events[0].phase == HORIZON_DIAG_ENTRY && events[1].phase == HORIZON_DIAG_ENTRY);
++    assert(events[2].phase == HORIZON_DIAG_HANDLER && events[3].phase == HORIZON_DIAG_RETURN);
++    assert(events[4].phase == HORIZON_DIAG_HANDLER && events[5].phase == HORIZON_DIAG_RETURN);
++    assert((NTSTATUS)wine_nx_do_syscall(NULL,0,0,0,0,0,0,0,0,2,0x5000) == STATUS_INVALID_SYSTEM_SERVICE);
++    assert(horizon_diag_current.syscall == ~0u);
++    assert((NTSTATUS)wine_nx_do_syscall(NULL,0,0,0,0,0,0,0,0,4095,0x6000) == STATUS_INVALID_SYSTEM_SERVICE);
++    assert(horizon_diag_current.syscall == ~0u);
++    puts("suspend diagnostics: production dispatcher args/result, nested ID/phase/PC/SP and invalid exits passed");
++}
++'''
++with tempfile.TemporaryDirectory(prefix='suspend-dispatch-') as directory:
++    path = Path(directory)
++    (path / 'test.c').write_text(fixture)
++    subprocess.run([os.environ.get('WINE_NX_HOST_CC', '/usr/bin/clang'), '-std=gnu11', '-g', '-O1',
++                    '-fms-extensions', '-Wall', '-Wextra', '-Werror', '-Wno-missing-field-initializers',
++                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-pthread', '-D__WINESRC__', '-D_WIN64',
++                    '-I' + str(root / 'include'), '-I' + str(root / 'dlls/ntdll/unix'),
++                    str(path / 'test.c'), '-o', str(path / 'test')], check=True)
++    subprocess.run([str(path / 'test')], check=True, timeout=30)
