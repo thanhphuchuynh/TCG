@@ -1,6 +1,6 @@
 # Base-body streaming implementation plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Remove the eight audited body meshes from eager player dependencies while preserving their complete authored data and character setup behavior.
 
@@ -37,11 +37,11 @@
 
 **Interfaces:** Consumes existing `MeshBundleOwner.Prepare()` lifecycle; produces `public static void PrepareRoot(GameObject root)` (root component only, absent owner no-op), plus `prepare(project)` receipt version2 with raw `baselineSha256`, `preparedSha256`, and compatible `sha256`.
 
-- [ ] Write behavioral tests executing patched C#: first Initialize inspects ready geometry and reused Initialize enters its original branch after preparation. Test fresh/repeated prepare, legacy upgrade, source/backup drift, missing receipt, and raw CRLF preservation using temporary isolated project layouts.
-- [ ] Run `python3 -m unittest discover -s tools/compatibility/switch-streaming/Tests -p test_prepare_character_meshes.py`; expect failure for missing initialization and receipt guards. Use bundled Python3.12 for subsequent complete suites.
-- [ ] Add the root hook before original Initialize statements. Implement exact-byte receipt validation: legacy backup is trusted only when old two-hook transform recreates the recorded current bytes; version2 validates both current and backup. Stage calculations/validation before writes; atomic receipt replacement.
-- [ ] Add native Unity runtime cases: inactive root with another child owner prepares only root, real blendshape names available before setup, reused preparation preserves weights, inactive cleanup releases pins, later activation restores state, absent owner no-op. Run native fixtures through licensed Hub editor. Expect complete mesh runtime suite PASS.
-- [ ] Run full89+ Python fixture suite and8 host tests; commit source-only Task1 changes after verification.
+- [x] Write behavioral tests executing patched C#: first Initialize inspects ready geometry and reused Initialize enters its original branch after preparation. Test fresh/repeated prepare, legacy upgrade, source/backup drift, missing receipt, and raw CRLF preservation using temporary isolated project layouts.
+- [x] Run `python3 -m unittest discover -s tools/compatibility/switch-streaming/Tests -p test_prepare_character_meshes.py`; expect failure for missing initialization and receipt guards. Use bundled Python3.12 for subsequent complete suites.
+- [x] Add the root hook before original Initialize statements. Implement exact-byte receipt validation: legacy backup is trusted only when old two-hook transform recreates the recorded current bytes; version2 validates both current and backup. Stage calculations/validation before writes; atomic receipt replacement.
+- [x] Add native Unity runtime cases: inactive root with another child owner prepares only root, real blendshape names available before setup, reused preparation preserves weights, inactive cleanup releases pins, later activation restores state, absent owner no-op. Run native fixtures through licensed Hub editor. Expect complete mesh runtime suite PASS.
+- [x] Run full89+ Python fixture suite and8 host tests; commit source-only Task1 changes after verification.
 
 ### Task 2: Audited body preparation and in-memory scene conversion
 
@@ -49,11 +49,11 @@
 
 **Interfaces:** Consumes Task1 root owner and existing `MeshRecord`, `MeshBinding`, `MeshManifest`, usage preservation. Produces `BodyMeshBuild.Prepare()`, `Restore()`, `ProcessScene(Scene,BuildReport)` and strict testable audit/conversion helpers. Extract `CharacterMeshBuild.RewriteHierarchy(GameObject,IList<MeshRecord>) -> int` and expose whole-batch `ValidatePrefabSnapshots` without changing old prefab semantics.
 
-- [ ] Write synthetic native tests for exact body renderer ownership, all GUID occurrence accounting, unknown consumer rejection, inactive scene binding conversion, bones/materials/LOD/bounds/weights retention, original scene bytes, and whole-batch restore refusing late drift. Run before implementation; expect missing body API failure.
-- [ ] Implement strict native body audit: eight standalone meshes, exactly248 skinned slots/62 roots, Start224/56 and six prefabs4 each, actual CharacterCustomization.MainMesh link verified; scan all Assets for unexplained direct/GUID refs. Fail closed on changed identity/counts. Fixture helper accepts explicit test expectations; production pins the audited counts/paths.
-- [ ] Implement six-prefab snapshots plus both manifest snapshots and source scene stamp in one versioned journal. Validate complete batches before writes/restores; atomically record each known prepared hash. Build only eight independent bundles, preserve flags/CRC, append eight entries to existing252 canonical manifest, preserve all old bundle hashes.
-- [ ] Implement build callback for the prepared Start scene on StandaloneWindows only: validate journal/scene identity/hash, match every audited slot/root, rewrite in-memory hierarchy with original binding data. No source scene save. Record callback proof and require expected scene accounting.
-- [ ] Run all native synthetic tests, including actual baseline/converted Win32 payload proof and failed recovery cases. Expect no source hash changes and unchanged control mesh; run existing mesh build/audit/restore suites; commit Task2 source-only changes.
+- [x] Write synthetic native tests for exact body renderer ownership, all GUID occurrence accounting, unknown consumer rejection, inactive scene binding conversion, bones/materials/LOD/bounds/weights retention, original scene bytes, and whole-batch restore refusing late drift. Run before implementation; expect missing body API failure.
+- [x] Implement strict native body audit: eight standalone meshes, exactly248 skinned slots/62 roots, Start224/56 and six prefabs4 each, actual CharacterCustomization.MainMesh link verified; scan all Assets for unexplained direct/GUID refs. Fail closed on changed identity/counts. Fixture helper accepts explicit test expectations; production pins the audited counts/paths.
+- [x] Implement six-prefab snapshots plus both manifest snapshots and source scene stamp in one versioned journal. Validate complete batches before writes/restores; atomically record each known prepared hash. Build only eight independent bundles, preserve flags/CRC, append eight entries to existing252 canonical manifest, preserve all old bundle hashes.
+- [x] Implement build callback for the prepared Start scene on StandaloneWindows only: validate journal/scene identity/hash, match every audited slot/root, rewrite in-memory hierarchy with original binding data. No source scene save. Record callback proof and require expected scene accounting.
+- [x] Run all native synthetic tests, including actual baseline/converted Win32 payload proof and failed recovery cases. Expect no source hash changes and unchanged control mesh; run existing mesh build/audit/restore suites; commit Task2 source-only changes.
 
 ### Task 3: Full player integration and exact payload validation
 
@@ -61,10 +61,10 @@
 
 **Interfaces:** Consumes Task2 guarded preparation and callback; produces combined260 manifest, exact body payload proof, direct scene player and build evidence.
 
-- [ ] Write failing validator fixtures:260 manifest allowed only with complete expected original8 body identities; body resident payload or changed non-body mesh/texture multiset is rejected. Run RED before implementation.
-- [ ] Restore body before choice restoration/regeneration; prepare body after art/choice/surfaces. Verify build callback actually ran, source scene bytes unchanged, all old bundle hashes unchanged, exact resident/SD manifest, Mono/OpenGL/quality5/x86/LAA/FAT32 checks.
-- [ ] Copy only reviewed source tools and guarded hook into private clone; rebuild using the legitimate licensed Hub session. Keep previous player preserved. Expect successful Unity report and independent260 bundle payload/CRC/flags proof, body absent from resident player, non-body mesh/texture signatures equal previous verified player.
-- [ ] Run complete Python/host/native regression suites and record exact commands/counts. Commit source-only changes and documentation.
+- [x] Write failing validator fixtures:260 manifest allowed only with complete expected original8 body identities; body resident payload or changed non-body mesh/texture multiset is rejected. Run RED before implementation.
+- [x] Restore body before choice restoration/regeneration; prepare body after art/choice/surfaces. Verify build callback actually ran, source scene bytes unchanged, all old bundle hashes unchanged, exact resident/SD manifest, Mono/OpenGL/quality5/x86/LAA/FAT32 checks.
+- [x] Copy only reviewed source tools and guarded hook into private clone; rebuild using the legitimate licensed Hub session. Keep previous player preserved. Expect successful Unity report and independent260 bundle payload/CRC/flags proof, body absent from resident player, non-body mesh/texture signatures equal previous verified player.
+- [x] Run complete Python/host/native regression suites and record exact commands/counts. Commit source-only changes and documentation.
 
 ### Task 4: 4 GiB replay and gameplay profiling
 
