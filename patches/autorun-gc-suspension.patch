@@ -1,4 +1,4 @@
-From 695f5f75601da6f008c307e8bc980affd61870a7 Mon Sep 17 00:00:00 2001
+From b7cced75bb53a10304a605718a1f8be968da4d3e Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
 Date: Wed, 28 Oct 2026 13:49:34 +0700
 Subject: [PATCH] ntdll: suspend WoW64 threads through the CPU backend on
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  6 files changed, 146 insertions(+), 7 deletions(-)
 
 diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
-index 2d558c17..ff616b64 100644
+index 2d558c17..575d6feb 100644
 --- a/dlls/ntdll/unix/horizon.c
 +++ b/dlls/ntdll/unix/horizon.c
 @@ -11860,13 +11860,26 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
@@ -61,7 +61,7 @@ index 2d558c17..ff616b64 100644
  }
  #endif
  
-@@ -12068,8 +12081,14 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+@@ -12068,8 +12081,15 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
          else if (!object->thread.started) status = HORIZON_STATUS_NOT_SUPPORTED;
          else
          {
@@ -69,20 +69,20 @@ index 2d558c17..ff616b64 100644
 +             * contexts soon. Any other thread may be blocked outside a
 +             * server wait, on a futex or in a spin the caller itself is
 +             * holding (the CPU backend calls this to make sure a thread it
-+             * stopped is suspended); its contexts are not available, so
-+             * succeed without any. Its i386 state is in its CPU area. */
++             * stopped is suspended), or parked in a server wait that had no
++             * contexts to hand over; succeed without any. Its i386 state is
++             * in its CPU area. */
              while (!object->thread_context_valid && object->thread.suspend &&
 -                   !object->thread.terminated)
 +                   !object->thread.terminated && horizon_server_has_chpe_doorbell_locked( object ))
              {
                  horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
                  horizon_server_quit_check_locked();
-@@ -12084,7 +12103,7 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+@@ -12084,7 +12104,6 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
                  found = 1;
                  break;
              }
 -            if (!found && !status) status = HORIZON_STATUS_NOT_SUPPORTED;
-+            if (!found && !status && object->thread_context_valid) status = HORIZON_STATUS_NOT_SUPPORTED;
          }
      }
      pthread_mutex_unlock( &horizon_server_objects_mutex );
