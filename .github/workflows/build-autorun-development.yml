@@ -39,13 +39,14 @@ jobs:
         run: |
           sh horizon-wine/tools/bootstrap-box64-core.sh
           sh horizon-wine/tools/bootstrap-wma.sh
-      - name: Build x86 runtime with upstream SDK
+      - name: Build FEX runtime with upstream SDK
         working-directory: upstream
         run: |
           docker pull ghcr.io/autorunhq/switch-dev:2026.10.01
           docker run --rm --network none -v "$PWD:/work" -w /work ghcr.io/autorunhq/switch-dev:2026.10.01 sh -ec '
-            cmake -S horizon-wine -B horizon-wine/build-switch-wow64-mesa-switch -G Ninja -DCMAKE_TOOLCHAIN_FILE=/work/horizon-wine/cmake/switch-devkitA64.cmake -DWINE_NX_PE_BUILD_DIR=/work/horizon-wine/build-wine-amd64-pe -DWINE_NX_BOX64_DYNAREC=ON -DWINE_NX_USB_STORAGE=ON -DCMAKE_BUILD_TYPE=Release
-            cmake --build horizon-wine/build-switch-wow64-mesa-switch --target wine-nx-runtime-nro -j2
+            git config --global --add safe.directory /work/horizon-wine/vendor/box64
+            cmake -S horizon-wine -B horizon-wine/build-switch-amd64-fex -G Ninja -DCMAKE_TOOLCHAIN_FILE=/work/horizon-wine/cmake/switch-devkitA64.cmake -DWINE_NX_PE_BUILD_DIR=/work/horizon-wine/build-wine-amd64-pe -DWINE_NX_AMD64=ON -DWINE_NX_FEX=ON -DWINE_NX_BOX64_INTERPRETER=ON -DWINE_NX_BOX64_DYNAREC=ON -DWINE_NX_USB_STORAGE=ON -DCMAKE_BUILD_TYPE=Release
+            cmake --build horizon-wine/build-switch-amd64-fex --target wine-nx-runtime-nro -j2
           '
       - name: Save build provenance
         working-directory: upstream
@@ -54,11 +55,11 @@ jobs:
           git rev-parse HEAD > development-artifact/upstream-commit.txt
           git submodule status > development-artifact/submodule-commits.txt
           docker image inspect ghcr.io/autorunhq/switch-dev:2026.10.01 --format '{{index .RepoDigests 0}}' > development-artifact/sdk-image-digest.txt
-          find horizon-wine/build-switch-wow64-mesa-switch -type f \( -name '*.nro' -o -name '*.elf' \) -exec cp {} development-artifact/ \;
+          find horizon-wine/build-switch-amd64-fex -type f \( -name '*.nro' -o -name '*.elf' \) -exec cp {} development-artifact/ \;
           sha256sum development-artifact/* > development-artifact/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: autorun-development-x86
+          name: autorun-development-fex
           path: upstream/development-artifact/
           if-no-files-found: error
           retention-days: 7
