@@ -1,0 +1,65 @@
+From d84f31e638a1ff08ccd47d9c191277da4f67e807 Mon Sep 17 00:00:00 2001
+From: tphuc <phuc.huynhthanh@avironactive.com>
+Date: Wed, 28 Oct 2026 11:02:10 +0700
+Subject: [PATCH] ntdll: read another thread's i386 context on Horizon
+
+A garbage collector suspends a thread and reads its context. A thread
+already blocked in a server wait parks without handing the server any
+context, so take its i386 state from its WoW64 CPU area instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/signal_arm64.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index db9a7a29..5f562379 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -148,13 +148,42 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
+                                           (I386_CONTEXT *)ctx, TRUE );
+ }
+ 
++/* Another thread's i386 context, as a garbage collector reads it after
++ * NtSuspendThread. A thread the suspension stopped in translated code parks
++ * in wait_suspend and hands the server its contexts. One that was already
++ * blocked in a server wait parks there without any (the server answers
++ * STATUS_NOT_SUPPORTED); its i386 state is the one WoW64 saved in its CPU
++ * area on the way into the call, which stays put while it is suspended. */
++static NTSTATUS get_other_thread_wow64_context( HANDLE handle, I386_CONTEXT *ctx )
++{
++    THREAD_BASIC_INFORMATION info;
++    WOW64_CPURESERVED *cpu;
++    NTSTATUS status;
++    BOOL self;
++    TEB *teb;
++
++    status = get_thread_context( handle, ctx, &self, IMAGE_FILE_MACHINE_I386 );
++    if (status != STATUS_NOT_SUPPORTED || self) return status;
++
++    if ((status = NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL )))
++        return status;
++    if (!(teb = info.TebBaseAddress) || !(cpu = teb->TlsSlots[WOW64_TLS_CPURESERVED]))
++        return STATUS_NOT_SUPPORTED;
++    return horizon_transfer_i386_context( cpu,
++                                          (I386_CONTEXT *)(((ULONG_PTR)(cpu + 1) + TYPE_ALIGNMENT(I386_CONTEXT) - 1) &
++                                                           ~((ULONG_PTR)TYPE_ALIGNMENT(I386_CONTEXT) - 1)),
++                                          ctx, FALSE );
++}
++
+ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+ {
+     WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
+     NTSTATUS status;
+ 
+     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+-    if ((status = check_current_thread_context_access( handle, THREAD_GET_CONTEXT ))) return status;
++    status = check_current_thread_context_access( handle, THREAD_GET_CONTEXT );
++    if (status == STATUS_NOT_IMPLEMENTED) return get_other_thread_wow64_context( handle, ctx );
++    if (status) return status;
+     if (!cpu) return STATUS_INVALID_PARAMETER;
+     return horizon_transfer_i386_context( cpu,
+                                           get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_I386 ), ctx, FALSE );
+-- 
+2.54.0 (Apple Git-157)
+

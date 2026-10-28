@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches: [build/switch-compat-nsp]
-    paths: [.github/workflows/build-autorun-development.yml]
+    paths: [.github/workflows/build-autorun-development.yml, patches/**]
 
 permissions:
   contents: read
@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - uses: actions/checkout@v4
       - name: Install host build tools
         run: sudo apt-get update && sudo apt-get install -y bison flex cmake ninja-build build-essential gettext pkg-config
       - name: Fetch pinned upstream source
@@ -21,6 +22,8 @@ jobs:
           git clone --filter=blob:none --no-checkout https://github.com/autorunhq/autorun.git upstream
           git -C upstream checkout 1ac9b6cf37b90f2d5783dd7ef389bebbe1c68877
           git -C upstream submodule update --init horizon-dlls
+      - name: Apply own runtime patches
+        run: git -C upstream apply --verbose "$PWD/patches/autorun-wow64-remote-context.patch"
       - name: Install upstream Windows cross compiler
         run: |
           curl --fail --location --retry 3 -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20260505/llvm-mingw-20260505-ucrt-ubuntu-22.04-x86_64.tar.xz
