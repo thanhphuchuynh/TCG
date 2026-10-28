@@ -58,6 +58,7 @@ namespace TCG.SwitchStreaming.Editor
                     throw new InvalidOperationException("Run only in the prepared private switch-on-demand clone");
                 if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.StandaloneWindows || !BuildPipeline.IsBuildTargetSupported(BuildTargetGroup.Standalone, BuildTarget.StandaloneWindows))
                     throw new InvalidOperationException("Start Unity with -buildTarget Win and the x86 Windows module installed");
+                CharacterMeshBuild.Restore();
                 // Recover only our previous serialized-asset edits on a retry.
                 if (Directory.Exists(snapshots))
                 {
@@ -125,6 +126,7 @@ namespace TCG.SwitchStreaming.Editor
                 AssetDatabase.SaveAssets();
                 var remaining = ReferenceAudit.FindEagerReferences(audit.Eligible);
                 if (remaining.Count != 0) throw new InvalidOperationException("Unexplained eager artwork references remain: " + String.Join("; ", remaining.ToArray()));
+                CharacterMeshBuild.Prepare();
                 PlayerSettings.SetScriptingBackend(NamedBuildTarget.Standalone, ScriptingImplementation.Mono2x);
                 PlayerSettings.SetManagedStrippingLevel(NamedBuildTarget.Standalone, ManagedStrippingLevel.Disabled);
                 PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.StandaloneWindows, false);
