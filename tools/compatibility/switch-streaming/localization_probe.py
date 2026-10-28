@@ -16,7 +16,8 @@ from prepare_project import block_end, mask_csharp, method_bounds
 
 TRACE = "TCG.SwitchStreaming.LocalizationTrace"
 ATTRIBUTE = "[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]"
-MARKER = "TCG_LOCALIZATION_PROBE_V1"
+MARKER = "TCG_LOCALIZATION_PROBE_V2"
+LEGACY_HELPER_SHA256 = "3efbd63e9aafc4ed0710d13d5ab95ad43e08256b82e929c2715bd02bb0e3381f"
 HEADER = re.compile(r"\A\ufeff?// " + MARKER + r" original=([a-f0-9]{64}) body=([a-f0-9]{64})\n")
 SNAPSHOT = "Sources == null ? -1 : Sources.Count, GlobalSources == null ? -1 : GlobalSources.Length, mCurrentLanguage == null ? -1 : mCurrentLanguage.Length, mLanguageCode"
 
@@ -53,8 +54,16 @@ def _getter_bounds(source, name):
     return declaration, start, block_end(masked, start)
 
 
-def _stage(label):
-    return TRACE + '.Stage("' + label + '", ' + SNAPSHOT + ');'
+def _bare(label, handler=False):
+    # Protect even the sink entry/trampoline; no localization fields are evaluated here.
+    method = "Boundary" if handler else "Stage"
+    args = '"' + label + '"' if handler else '"' + label + '", -1, -1, -1, null'
+    return "try\n{\n" + TRACE + "." + method + "(" + args + ");\n}\ncatch (System.Exception) { }"
+
+
+def _snapshot(label):
+    return ("try\n{\n" + TRACE + '.Snapshot("' + label + '.snapshot", ' + SNAPSHOT +
+            ");\n}\ncatch (System.Exception)\n{\n" + _bare(label + ".snapshot-failed") + "\n}")
 
 
 def _instrument_calls(body, name, label, expected, qualifier="", declaration=False):
@@ -78,7 +87,7 @@ def _instrument_calls(body, name, label, expected, qualifier="", declaration=Fal
         indent = match.group(1)
         tag = label + ("." + str(number) if expected > 1 else "")
         original = body[match.start():end]
-        changes.append((match.start(), end, indent + _stage(tag + ".before") + "\n" + original + "\n" + indent + _stage(tag + ".after")))
+        changes.append((match.start(), end, indent + _bare(tag + ".before") + "\n" + original + "\n" + indent + _bare(tag + ".after")))
     for start, end, replacement in reversed(changes): body = body[:start] + replacement + body[end:]
     return body
 
@@ -95,10 +104,33 @@ def _instrument_body(body, name):
 
 def _wrap_body(body, name):
     body = _instrument_body(body, name)
-    return ("\n// TCG_LOCALIZATION_BOUNDARY_" + name + "\n" + _stage(name + ".enter") +
-            "\ntry\n{" + body + "\n}\ncatch (System.Exception tcgLocalizationProbeError)\n{\n" +
-            TRACE + '.Failure("' + name + '", tcgLocalizationProbeError, ' + SNAPSHOT + ");\nthrow;\n}\nfinally\n{\n" +
-            _stage(name + ".exit") + "\n}\n")
+    failure = TRACE + '.Failure("' + name + '", tcgLocalizationProbeError, -1, -1, -1, null);'
+    return ("\n// TCG_LOCALIZATION_BOUNDARY_" + name + "\ntry\n{\n" + _bare(name + ".enter") +
+            "\n" + _snapshot(name) + body + "\n}\ncatch (System.Exception tcgLocalizationProbeError)\n{\n" +
+            _bare(name + ".catch-enter", True) + "\ntry\n{\n" + failure + "\n}\ncatch (System.Exception) { }\nthrow;\n}\nfinally\n{\n" +
+            _bare(name + ".finally-enter", True) + "\n}\n")
+
+
+def _split_resource_lookup(source):
+    start, end = method_bounds(source, "private static void RegisterSourceInResources()")
+    body = source[start + 1:end]
+    masked = mask_csharp(body)
+    pattern = re.compile(r"(?m)^([ \t]*)LanguageSourceAsset\s+(\w+)\s*=\s*ResourceManager\.pInstance\.GetAsset<LanguageSourceAsset>\(\s*(\w+)\s*\)\s*;")
+    matches = list(pattern.finditer(masked))
+    if len(matches) != 1: raise ValueError("Unknown single resource singleton/asset lookup shape")
+    match = matches[0]
+    asset = match.group(2)
+    original = body[match.start():match.end()]
+    if "tcgLocalizationProbeResourceManager" in masked: raise ValueError("Resource diagnostic local already exists")
+    replacement = (_bare("RESOURCE.singleton.before") + "\nvar tcgLocalizationProbeResourceManager = ResourceManager.pInstance;\n" +
+                   _bare("RESOURCE.singleton.after") + "\n" + _bare("RESOURCE.asset.before") + "\n" +
+                   original.replace("ResourceManager.pInstance", "tcgLocalizationProbeResourceManager", 1) + "\n" +
+                   _bare("RESOURCE.asset.after") + "\ntry\n{\n" + TRACE + '.ObjectState("RESOURCE.asset.state", ' +
+                   'System.Object.ReferenceEquals(' + asset + ', null), System.Object.ReferenceEquals(' + asset +
+                   ', null) || System.Object.ReferenceEquals(' + asset + '.mSource, null));\n}\ncatch (System.Exception)\n{\n' +
+                   _bare("RESOURCE.asset.snapshot-failed") + "\n}")
+    body = body[:match.start()] + replacement + body[match.end():]
+    return source[:start + 1] + body + source[end:]
 
 
 def patch_localization(source):
@@ -107,6 +139,8 @@ def patch_localization(source):
         if digest(source[header.end():]) != header.group(2): raise ValueError("Instrumented source was modified; refusing partial/double patch")
         if source.count("// TCG_LOCALIZATION_BOUNDARY_") != 5 or source.count(ATTRIBUTE) != 5: raise ValueError("Incomplete diagnostic patch")
         return source
+    if "TCG_LOCALIZATION_PROBE_V1" in source:
+        raise ValueError("V1 probe requires restoration from the verified .tcg-localization-probe/LocalizationManager.cs.original backup before V2; no automatic source inference or overwrite is permitted")
     if MARKER in source or "TCG_LOCALIZATION_BOUNDARY_" in source: raise ValueError("Unknown or partial diagnostic patch")
     _validate_blocks(source)
     original_hash = digest(source)
@@ -121,6 +155,7 @@ def patch_localization(source):
         declaration = mask_csharp(body).rfind(signature, 0, start)
         replacement = ATTRIBUTE + "\n" + body[declaration:start + 1] + _wrap_body(body[start + 1:end], name) + "}"
         body = body[:declaration] + replacement + body[end + 1:]
+    body = _split_resource_lookup(body)
     return bom + "// " + MARKER + " original=" + original_hash + " body=" + digest(body) + "\n" + body
 
 
@@ -156,12 +191,14 @@ def prepare_localization_probe(project):
         patched = expected
     elif HEADER.match(current): raise ValueError("Instrumented source has no preserved original backup")
     helper_bytes = helper.read_bytes()
-    if helper_path.exists() and helper_path.read_bytes() != helper_bytes: raise ValueError("Existing diagnostic helper differs; refusing replacement")
+    helper_changed = not helper_path.exists() or helper_path.read_bytes() != helper_bytes
+    if helper_path.exists() and helper_changed and hashlib.sha256(helper_path.read_bytes()).hexdigest() != LEGACY_HELPER_SHA256:
+        raise ValueError("Existing diagnostic helper differs; refusing replacement")
     # Validate every input and collision before the first mutation. Back up original bytes exactly once.
     if not backup.exists():
         backup.parent.mkdir(parents=True, exist_ok=True)
         with backup.open("xb") as stream: stream.write(current.encode("utf-8"))
-    if not helper_path.exists(): _atomic_write(helper_path, helper_bytes)
+    if helper_changed: _atomic_write(helper_path, helper_bytes)
     if current != patched: _atomic_write(source_path, patched.encode("utf-8"))
     return {"source": str(source_path), "backup": str(backup), "helper": str(helper_path), "sha256": digest(patched)}
 
