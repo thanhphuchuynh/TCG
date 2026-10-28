@@ -1,42 +1,163 @@
-From d84f31e638a1ff08ccd47d9c191277da4f67e807 Mon Sep 17 00:00:00 2001
+From 2a36ecc92ef3316800de7b1b1072faf09642bcc2 Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
-Date: Wed, 28 Oct 2026 11:02:10 +0700
-Subject: [PATCH 1/2] ntdll: read another thread's i386 context on Horizon
+Date: Wed, 28 Oct 2026 13:49:34 +0700
+Subject: [PATCH] ntdll: suspend WoW64 threads through the CPU backend on
+ Horizon
 
-A garbage collector suspends a thread and reads its context. A thread
-already blocked in a server wait parks without handing the server any
-context, so take its i386 state from its WoW64 CPU area instead.
+Mono's garbage collector suspends every thread and reads its i386 context.
+On Horizon nothing stopped a thread running translated code or blocked in a
+futex, and the server waited forever for a context such a thread never sent.
+
+- NtSuspendThread in a WoW64 process calls BTCpuSuspendLocalThread, as
+  Windows does through Wow64SuspendLocalThread: FEX interrupts the thread's
+  JIT and flushes its i386 state to the CPU area.
+- The server rings a doorbell in the thread's TEB; the thread parks in
+  wait_suspend on its next system call entry or exit, including the
+  NtContinue that takes it back into the JIT.
+- get_thread_context waits only for ARM64EC threads, which park by themselves.
+- Another thread's i386 context is read from and written to its CPU area.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- dlls/ntdll/unix/signal_arm64.c | 31 ++++++++++++++++++++++++++++++-
- 1 file changed, 30 insertions(+), 1 deletion(-)
+ dlls/ntdll/unix/horizon.c         | 29 ++++++++++---
+ dlls/ntdll/unix/horizon_private.h |  2 +
+ dlls/ntdll/unix/loader.c          | 24 +++++++++++
+ dlls/ntdll/unix/signal_arm64.c    | 70 ++++++++++++++++++++++++++++++-
+ dlls/ntdll/unix/thread.c          | 27 ++++++++++++
+ dlls/ntdll/unix/unix_private.h    |  1 +
+ 6 files changed, 146 insertions(+), 7 deletions(-)
 
-diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
-index db9a7a29..5f562379 100644
---- a/dlls/ntdll/unix/signal_arm64.c
-+++ b/dlls/ntdll/unix/signal_arm64.c
-@@ -148,13 +148,42 @@ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
-                                           (I386_CONTEXT *)ctx, TRUE );
+diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
+index 2d558c17..ff616b64 100644
+--- a/dlls/ntdll/unix/horizon.c
++++ b/dlls/ntdll/unix/horizon.c
+@@ -11860,13 +11860,26 @@ static int horizon_server_handle_query_directory_file( struct horizon_server_con
+ static void *horizon_server_thread( void *param );
+ 
+ #ifndef HORIZON_STANDALONE_SYNTAX
+-static void horizon_server_set_suspend_doorbell_locked( struct horizon_server_object *object, int value )
++/* An ARM64EC thread checks its CHPE doorbell in translated code and parks
++ * there by itself; any other thread checks its TEB doorbell on its system
++ * calls (horizon_park_if_suspended). */
++static BOOL horizon_server_has_chpe_doorbell_locked( struct horizon_server_object *object )
+ {
+     TEB *teb = (TEB *)(ULONG_PTR)object->thread.teb;
+     CHPE_V2_CPU_AREA_INFO *area;
+ 
+-    if (!teb || !(area = teb->ChpeV2CpuAreaInfo) || !area->SuspendDoorbell) return;
+-    __atomic_store_n( area->SuspendDoorbell, value, __ATOMIC_RELEASE );
++    return teb && (area = teb->ChpeV2CpuAreaInfo) && area->SuspendDoorbell;
++}
++
++static void horizon_server_set_suspend_doorbell_locked( struct horizon_server_object *object, int value )
++{
++    TEB *teb = (TEB *)(ULONG_PTR)object->thread.teb;
++
++    if (!teb) return;
++    if (horizon_server_has_chpe_doorbell_locked( object ))
++        __atomic_store_n( teb->ChpeV2CpuAreaInfo->SuspendDoorbell, value, __ATOMIC_RELEASE );
++    else
++        __atomic_store_n( &((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell, value, __ATOMIC_RELEASE );
+ }
+ #endif
+ 
+@@ -12068,8 +12081,14 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+         else if (!object->thread.started) status = HORIZON_STATUS_NOT_SUPPORTED;
+         else
+         {
++            /* Only an ARM64EC thread is sure to park and hand over its
++             * contexts soon. Any other thread may be blocked outside a
++             * server wait, on a futex or in a spin the caller itself is
++             * holding (the CPU backend calls this to make sure a thread it
++             * stopped is suspended); its contexts are not available, so
++             * succeed without any. Its i386 state is in its CPU area. */
+             while (!object->thread_context_valid && object->thread.suspend &&
+-                   !object->thread.terminated)
++                   !object->thread.terminated && horizon_server_has_chpe_doorbell_locked( object ))
+             {
+                 horizon_server_sleep_locked( HORIZON_SERVER_WAIT_SLICE );
+                 horizon_server_quit_check_locked();
+@@ -12084,7 +12103,7 @@ static int horizon_server_handle_get_thread_context( struct horizon_server_conne
+                 found = 1;
+                 break;
+             }
+-            if (!found && !status) status = HORIZON_STATUS_NOT_SUPPORTED;
++            if (!found && !status && object->thread_context_valid) status = HORIZON_STATUS_NOT_SUPPORTED;
+         }
+     }
+     pthread_mutex_unlock( &horizon_server_objects_mutex );
+diff --git a/dlls/ntdll/unix/horizon_private.h b/dlls/ntdll/unix/horizon_private.h
+index f33f8c57..af440aff 100644
+--- a/dlls/ntdll/unix/horizon_private.h
++++ b/dlls/ntdll/unix/horizon_private.h
+@@ -36,6 +36,8 @@ extern void wine_nx_thread_set_name( unsigned int tid, const char *name ) __attr
+ extern void wine_nx_thread_set_affinity( unsigned int tid, unsigned int mask ) __attribute__((weak));
+ extern __thread int horizon_suspend_pending;
+ extern void horizon_wait_suspend_arm64ec(void);
++extern void horizon_park_if_suspended(void);
++extern void *horizon_find_module_export( const WCHAR *module, const char *name );
+ extern void horizon_get_memory_info( unsigned long long *total, unsigned long long *used );
+ extern void horizon_get_address_space_limits( void **start, void **limit );
+ extern void *virtual_alloc_horizon_native( size_t size, void **token );
+diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
+index cd362f5a..74c50a23 100644
+--- a/dlls/ntdll/unix/loader.c
++++ b/dlls/ntdll/unix/loader.c
+@@ -1677,6 +1677,30 @@ static const void *get_module_data_dir( HMODULE module, ULONG dir, ULONG *size )
+     return get_rva( module, data->VirtualAddress );
  }
  
-+/* Another thread's i386 context, as a garbage collector reads it after
-+ * NtSuspendThread. A thread the suspension stopped in translated code parks
-+ * in wait_suspend and hands the server its contexts. One that was already
-+ * blocked in a server wait parks there without any (the server answers
-+ * STATUS_NOT_SUPPORTED); its i386 state is the one WoW64 saved in its CPU
-+ * area on the way into the call, which stays put while it is suspended. */
-+static NTSTATUS get_other_thread_wow64_context( HANDLE handle, I386_CONTEXT *ctx )
++#ifdef __SWITCH__
++/* An export of a module the PE loader has loaded, found through the PEB.
++ * ponytail: reads the module list without the loader lock; only used for
++ * modules loaded at start-up, which stay put. */
++void *horizon_find_module_export( const WCHAR *name, const char *export )
++{
++    PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->Ldr;
++    LIST_ENTRY *entry;
++
++    if (!ldr) return NULL;
++    for (entry = ldr->InLoadOrderModuleList.Flink; entry != &ldr->InLoadOrderModuleList; entry = entry->Flink)
++    {
++        LDR_DATA_TABLE_ENTRY *mod = CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
++        const IMAGE_EXPORT_DIRECTORY *exports;
++
++        if (mod->BaseDllName.Length != wcslen( name ) * sizeof(WCHAR) ||
++            wcsnicmp( mod->BaseDllName.Buffer, name, wcslen( name ) )) continue;
++        if (!(exports = get_module_data_dir( mod->DllBase, IMAGE_DIRECTORY_ENTRY_EXPORT, NULL ))) return NULL;
++        return (void *)find_named_export( mod->DllBase, exports, export );
++    }
++    return NULL;
++}
++#endif
++
+ /***********************************************************************
+  *           load_ntdll_functions
+  */
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index db9a7a29..c8a58584 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -135,13 +135,41 @@ static NTSTATUS check_current_thread_context_access( HANDLE handle, ACCESS_MASK
+     return (info.GrantedAccess & access) == access ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
+ }
+ 
++/* Another thread's i386 context: the one in its WoW64 CPU area. The CPU
++ * backend suspends a thread of this process (BTCpuSuspendLocalThread, called
++ * from NtSuspendThread) by stopping it outside translated code and flushing
++ * its state there, and reloads the area when the thread resumes, so a
++ * garbage collector reads and writes the state the thread stopped with. */
++static NTSTATUS transfer_other_thread_wow64_context( HANDLE handle, I386_CONTEXT *ctx, BOOL set )
 +{
 +    THREAD_BASIC_INFORMATION info;
 +    WOW64_CPURESERVED *cpu;
++    ULONG suspended;
 +    NTSTATUS status;
-+    BOOL self;
 +    TEB *teb;
 +
-+    status = get_thread_context( handle, ctx, &self, IMAGE_FILE_MACHINE_I386 );
-+    if (status != STATUS_NOT_SUPPORTED || self) return status;
-+
++    if ((status = NtQueryInformationThread( handle, ThreadSuspendCount, &suspended, sizeof(suspended), NULL )))
++        return status;
++    if (!suspended) return STATUS_UNSUCCESSFUL;
 +    if ((status = NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL )))
 +        return status;
 +    if (!(teb = info.TebBaseAddress) || !(cpu = teb->TlsSlots[WOW64_TLS_CPURESERVED]))
@@ -44,65 +165,142 @@ index db9a7a29..5f562379 100644
 +    return horizon_transfer_i386_context( cpu,
 +                                          (I386_CONTEXT *)(((ULONG_PTR)(cpu + 1) + TYPE_ALIGNMENT(I386_CONTEXT) - 1) &
 +                                                           ~((ULONG_PTR)TYPE_ALIGNMENT(I386_CONTEXT) - 1)),
-+                                          ctx, FALSE );
++                                          ctx, set );
 +}
 +
- NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+ NTSTATUS set_thread_wow64_context( HANDLE handle, const void *ctx, ULONG size )
  {
      WOW64_CPURESERVED *cpu = NtCurrentTeb()->TlsSlots[WOW64_TLS_CPURESERVED];
      NTSTATUS status;
  
      if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
+-    if ((status = check_current_thread_context_access( handle, THREAD_SET_CONTEXT ))) return status;
++    status = check_current_thread_context_access( handle, THREAD_SET_CONTEXT );
++    if (status == STATUS_NOT_IMPLEMENTED) return transfer_other_thread_wow64_context( handle, (I386_CONTEXT *)ctx, TRUE );
++    if (status) return status;
+     if (!cpu) return STATUS_INVALID_PARAMETER;
+     return horizon_transfer_i386_context( cpu,
+                                           get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_I386 ),
+@@ -154,12 +182,46 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
+     NTSTATUS status;
+ 
+     if (size != sizeof(I386_CONTEXT)) return STATUS_INFO_LENGTH_MISMATCH;
 -    if ((status = check_current_thread_context_access( handle, THREAD_GET_CONTEXT ))) return status;
 +    status = check_current_thread_context_access( handle, THREAD_GET_CONTEXT );
-+    if (status == STATUS_NOT_IMPLEMENTED) return get_other_thread_wow64_context( handle, ctx );
++    if (status == STATUS_NOT_IMPLEMENTED) return transfer_other_thread_wow64_context( handle, ctx, FALSE );
 +    if (status) return status;
      if (!cpu) return STATUS_INVALID_PARAMETER;
      return horizon_transfer_i386_context( cpu,
                                            get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_I386 ), ctx, FALSE );
--- 
-2.54.0 (Apple Git-157)
-
-
-From f54b50b4380fe4e12ec285865009513de90196cd Mon Sep 17 00:00:00 2001
-From: tphuc <phuc.huynhthanh@avironactive.com>
-Date: Wed, 28 Oct 2026 12:11:39 +0700
-Subject: [PATCH 2/2] ntdll: let NtSuspendThread stop a sleeping thread on
- Horizon
-
-A sleep on Horizon was a plain svcSleepThread, which a suspension cannot
-interrupt: a garbage collector waiting for the thread's context then
-waited as long as the sleep, forever for an infinite one. Sleep in the
-server instead, where a suspended thread parks at once.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
----
- dlls/ntdll/unix/sync.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
-index 43c5d67b..42fdf5c7 100644
---- a/dlls/ntdll/unix/sync.c
-+++ b/dlls/ntdll/unix/sync.c
-@@ -2492,11 +2492,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
-         extern int horizon_async_any_ready(void);
+ }
  
-         /* wineserver interrupts a sleeping thread with a signal to run the
--         * socket operations that became ready for it. Horizon has no such
--         * signal: while one is ready, a sleep waits in the server instead,
--         * where it is handed over. The wait is not alertable, so no user APC
--         * runs, and it lasts as long as the sleep. */
--        if (horizon_async_any_ready())
-+         * socket operations that became ready for it, or to suspend it.
-+         * Horizon has no such signal, so a sleep waits in the server instead,
-+         * where both are handled: NtSuspendThread then stops the thread in
-+         * place rather than waiting for the sleep to end, which a garbage
-+         * collector does not. The wait is not alertable, so no user APC runs,
-+         * and it lasts as long as the sleep. A zero sleep only yields. */
-+        if (horizon_async_any_ready() || !timeout || timeout->QuadPart)
-         {
-             if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE, timeout )) == STATUS_TIMEOUT)
-                 status = STATUS_SUCCESS;
++/* Horizon cannot stop another thread, so NtSuspendThread rings its doorbell
++ * and the thread stops itself here, on the way into or out of a system call:
++ * before NtContinue takes it back into translated code after the CPU backend
++ * interrupted it, or when a call it was blocked in returns. */
++void horizon_park_if_suspended(void)
++{
++    struct teb_data *data = (struct teb_data *)&NtCurrentTeb()->GdiTebBatch;
++    CONTEXT context;
++
++    if (!__atomic_load_n( &data->suspend_doorbell, __ATOMIC_ACQUIRE )) return;
++    if (horizon_capture_context( &context )) return;
++    wait_suspend( &context );
++}
++
++/* Calls a PE function with two arguments and x18 = teb, returning its result. */
++extern NTSTATUS horizon_call_pe2( void *func, ULONG_PTR arg1, ULONG_PTR arg2, TEB *teb );
++__ASM_GLOBAL_FUNC( horizon_call_pe2,
++                   "hint 34\n\t"
++                   "stp x29, x30, [sp, #-64]!\n\t"
++                   "mov x29, sp\n\t"
++                   "stp x18, x23, [sp, #16]\n\t"
++                   "stp x24, x28, [sp, #32]\n\t"
++                   "mov x18, x3\n\t"
++                   "mov x16, x0\n\t"
++                   "mov x0, x1\n\t"
++                   "mov x1, x2\n\t"
++                   "blr x16\n\t"
++                   "ldp x18, x23, [sp, #16]\n\t"
++                   "ldp x24, x28, [sp, #32]\n\t"
++                   "ldp x29, x30, [sp], #64\n\t"
++                   "ret" )
++
+ extern void wine_nx_call_pe_apc( PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
+                                 CONTEXT *context, TEB *teb );
+ __ASM_GLOBAL_FUNC( wine_nx_call_pe_apc,
+@@ -566,6 +628,7 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+ 
+         if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
+     }
++    horizon_park_if_suspended();
+ #endif
+     SYSTEM_SERVICE_TABLE *table = &KeServiceDescriptorTable[table_idx];
+     ULONG_PTR *handler;
+@@ -646,6 +709,9 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+         wine_nx_runtime_trace( buf );
+     }
+ 
++#ifdef __SWITCH__
++    horizon_park_if_suspended();
++#endif
+     return result;
+ }
+ 
+diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
+index e7685ed1..53816b4f 100644
+--- a/dlls/ntdll/unix/thread.c
++++ b/dlls/ntdll/unix/thread.c
+@@ -1840,10 +1840,37 @@ NTSTATUS WINAPI NtOpenThread( HANDLE *handle, ACCESS_MASK access,
+ /******************************************************************************
+  *              NtSuspendThread   (NTDLL.@)
+  */
++#ifdef __SWITCH__
++extern NTSTATUS horizon_call_pe2( void *func, ULONG_PTR arg1, ULONG_PTR arg2, TEB *teb );
++static __thread BOOL horizon_cpu_suspending;
++#endif
++
+ NTSTATUS WINAPI NtSuspendThread( HANDLE handle, ULONG *count )
+ {
+     unsigned int ret;
+ 
++#ifdef __SWITCH__
++    /* Windows suspends a thread of a WoW64 process through the CPU backend
++     * (Wow64SuspendLocalThread), which takes it out of translated code and
++     * flushes its i386 state before suspending it with this same call; the
++     * PE side here does not, so do it for it. */
++    if (is_wow64() && !horizon_cpu_suspending)
++    {
++        static void *suspend_local_thread;
++        static const WCHAR fexW[] = {'l','i','b','w','o','w','6','4','f','e','x','.','d','l','l',0};
++
++        if (!suspend_local_thread)
++            suspend_local_thread = horizon_find_module_export( fexW, "BTCpuSuspendLocalThread" );
++        if (suspend_local_thread)
++        {
++            horizon_cpu_suspending = TRUE;
++            ret = horizon_call_pe2( suspend_local_thread, (ULONG_PTR)handle, (ULONG_PTR)count, NtCurrentTeb() );
++            horizon_cpu_suspending = FALSE;
++            return ret;
++        }
++    }
++#endif
++
+     SERVER_START_REQ( suspend_thread )
+     {
+         req->handle = wine_server_obj_handle( handle );
+diff --git a/dlls/ntdll/unix/unix_private.h b/dlls/ntdll/unix/unix_private.h
+index b3d25221..5445b3d4 100644
+--- a/dlls/ntdll/unix/unix_private.h
++++ b/dlls/ntdll/unix/unix_private.h
+@@ -152,6 +152,7 @@ struct teb_data
+     int                       syscall_trace; /* 21c/0380 syscall trace flag */
+ #ifdef __SWITCH__
+     struct thread_data       *thread;
++    int                       suspend_doorbell; /* set by the server while the thread is suspended */
+ #endif
+ };
+ 
 -- 
 2.54.0 (Apple Git-157)
 
