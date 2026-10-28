@@ -31,3 +31,10 @@ allocator overhead and uninstrumented allocations remain unclassified. Section
 requests include descriptor-only memory; alias lengths and VA reservations are
 separate and must not be summed into RAM. JIT arena capacity counts shared RX/RW
 storage once; JIT buffer capacity is a subset, not emitted code size.
+
+First 4 GiB replay: title passed, load failed33% with ENOMEM (24.0625 MiB
+backing request) despite120 MiB total free. JIT stayed112 MiB arenas/48 MiB
+buffers, not the unexplained bulk. Anonymous requests1495.6 MiB atfailure.
+Refine observation using existing tested native_heap statistics, including largest
+aligned/newlib holes and shared gap, before changing allocator semantics. These
+hole figures are snapshots, not guarantees that a particular alignment fits.

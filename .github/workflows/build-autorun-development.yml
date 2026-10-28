@@ -105,3 +105,4 @@ jobs:
         run: |
           sh upstream/horizon-wine/check-allocation-diagnostics.sh
           python3 upstream/horizon-wine/tests/check_fex_jit_bridge.py
+          python3 upstream/horizon-wine/tests/check_native_heap.py

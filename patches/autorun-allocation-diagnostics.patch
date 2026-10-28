@@ -122,7 +122,15 @@ diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
 diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
 --- a/horizon-wine/source/runtime.c
 +++ b/horizon-wine/source/runtime.c
-@@ -1366,9 +1366,21 @@
+@@ -25,6 +25,7 @@
+ #include "horizon_runtime_paths.h"
+ #include "launcher.h"
+ #include "low_window.h"
++#include "native_heap.h"
+ #include "autorun_install.h"
+ #include "forwarder.h"
+ #include "forwarder_launch.h"
+@@ -1366,9 +1367,29 @@
          {
              extern void wine_nx_thread_report( void );
              extern void horizon_memory_pool_stats( char *buffer, size_t size );
@@ -142,6 +150,14 @@ diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
 +                               stats.arena_bytes, stats.buffer_bytes, stats.arenas, stats.buffers );
 +            }
 +#endif
++            {
++                struct wine_nx_native_heap_stats stats;
++                wine_nx_native_heap_stats( &stats );
++                log_line( "[HEAP-ALLOC] aligned_used_bytes=%zu aligned_free_bytes=%zu aligned_largest_bytes=%zu "
++                          "small_free_bytes=%zu small_largest_bytes=%zu gap_bytes=%zu holes=%zu/%zu complete=%d",
++                          stats.used, stats.free, stats.largest, stats.small_free, stats.small_largest,
++                          stats.gap, stats.holes, stats.small_holes, stats.complete );
++            }
              wine_nx_thread_report();
          }
          return;
