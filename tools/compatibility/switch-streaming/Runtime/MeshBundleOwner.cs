@@ -44,6 +44,12 @@ namespace TCG.SwitchStreaming
             }
             catch { UnityEngine.Object.Destroy(clone); throw; }
         }
+        public static void PrepareRoot(GameObject root)
+        {
+            if (!root) throw new ArgumentNullException("root");
+            var owner = root.GetComponent<MeshBundleOwner>();
+            if (owner) owner.Prepare();
+        }
         void Awake() { Prepare(); }
         void OnEnable() { Prepare(); }
         public void Prepare()

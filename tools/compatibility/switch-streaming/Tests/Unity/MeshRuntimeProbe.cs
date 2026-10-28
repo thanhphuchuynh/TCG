@@ -67,6 +67,25 @@ public sealed class MeshRuntimeProbe : MonoBehaviour
         Check(skin.sharedMesh && skin.GetBlendShapeWeight(0) == 67 && skin.bones[0] == bone && skin.rootBone == rootBone && skin.localBounds == bounds, "Rehydrate lost current weights/bones/root/bounds");
         for (int i = 0; i < 4; i++) { a.gameObject.SetActive(false); a.gameObject.SetActive(true); Check(skin.GetBlendShapeWeight(0) == 67, "Repeated rehydrate lost setup state"); }
         a.gameObject.SetActive(false); passed++;
+        var body = Owner(First, false); var unrelated = Owner(Second, false);
+        unrelated.transform.SetParent(body.transform, false);
+        MeshBundleOwner.PrepareRoot(body.gameObject);
+        var bodySkin = body.GetComponent<SkinnedMeshRenderer>();
+        Check(bodySkin.sharedMesh && bodySkin.sharedMesh.GetBlendShapeName(0) == "smile" &&
+            !unrelated.GetComponent<SkinnedMeshRenderer>().sharedMesh && service.Cache.PinnedBytes == 1024,
+            "Inactive root initialization did not prepare exactly its own authored geometry");
+        bodySkin.SetBlendShapeWeight(0, 88);
+        yield return null; yield return null;
+        Check(!bodySkin.sharedMesh && service.Cache.PinnedBytes == 0, "Inactive root initialization retained geometry after setup frame");
+        MeshBundleOwner.PrepareRoot(body.gameObject);
+        Check(bodySkin.sharedMesh && bodySkin.GetBlendShapeWeight(0) == 88 && !unrelated.GetComponent<SkinnedMeshRenderer>().sharedMesh,
+            "Reused inactive initialization lost setup values or prepared unrelated child");
+        body.gameObject.SetActive(true);
+        Check(bodySkin.sharedMesh && bodySkin.GetBlendShapeWeight(0) == 88, "Body activation reset original setup state");
+        body.gameObject.SetActive(false); Destroy(body.gameObject); yield return null;
+        var ordinary = new GameObject("unmigrated customizer");
+        MeshBundleOwner.PrepareRoot(ordinary); Destroy(ordinary);
+        Check(service.Cache.PinnedBytes == 0 && service.InactivePendingCount == 0, "Root setup cleanup or no-owner path retained pins"); passed++;
         var parent = new GameObject("inactive original setup parent"); parent.SetActive(false);
         var source = Owner(First, false);
         var clone = MeshBundleOwner.Instantiate(source.gameObject, parent.transform);
