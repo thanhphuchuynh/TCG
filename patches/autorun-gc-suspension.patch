@@ -1,7 +1,7 @@
 From fdc3ae811c03bfcf4a453e1fb8a4a8c02dfb388c Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
 Date: Wed, 28 Oct 2026 13:49:34 +0700
-Subject: [PATCH] ntdll: suspend WoW64 threads through the CPU backend on
+Subject: [PATCH 1/2] ntdll: suspend WoW64 threads through the CPU backend on
  Horizon
 
 Mono's garbage collector suspends every thread and reads its i386 context.
@@ -333,6 +333,75 @@ index b3d25221..5445b3d4 100644
  #endif
  };
  
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 78acd3d06d31cd5c62c1cea4dbf3ac10e88d5623 Mon Sep 17 00:00:00 2001
+From: tphuc <phuc.huynhthanh@avironactive.com>
+Date: Wed, 28 Oct 2026 14:56:22 +0700
+Subject: [PATCH 2/2] runtime: list suspended threads in the stall report
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/horizon.c     | 22 ++++++++++++++++++++++
+ horizon-wine/source/runtime.c |  3 +++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
+index 575d6feb..0cfd808b 100644
+--- a/dlls/ntdll/unix/horizon.c
++++ b/dlls/ntdll/unix/horizon.c
+@@ -6832,6 +6832,28 @@ static long long horizon_server_now(void)
+     return now.QuadPart;
+ }
+ 
++#ifndef HORIZON_STANDALONE_SYNTAX
++/* For the stall report: which threads are suspended, and whether they parked.
++ * ponytail: reads without the object lock, so a value may be a moment stale. */
++void horizon_server_report_suspended( void (*print)( const char *line ) )
++{
++    struct horizon_server_object *object;
++    char line[160];
++
++    for (object = horizon_server_threads; object; object = object->thread_next)
++    {
++        TEB *teb = (TEB *)(ULONG_PTR)object->thread.teb;
++
++        if (!object->thread.suspend || object->thread.terminated) continue;
++        snprintf( line, sizeof(line), "[STALL] tid %04x suspended %d started %d parked %d contexts %u doorbell %d",
++                  object->thread.tid, object->thread.suspend, object->thread.started,
++                  object->thread_context_valid, object->thread_context_count,
++                  teb ? ((struct teb_data *)&teb->GdiTebBatch)->suspend_doorbell : -1 );
++        print( line );
++    }
++}
++#endif
++
+ /* A new thread object with no handles; the caller adds the references. */
+ static struct horizon_server_object *horizon_server_alloc_thread_locked( unsigned int tid, unsigned int pid )
+ {
+diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
+index 564ee1e0..b17b617b 100644
+--- a/horizon-wine/source/runtime.c
++++ b/horizon-wine/source/runtime.c
+@@ -457,6 +457,8 @@ static void open_game_log( const char *target )
+     log_line( "[LOG] this run is kept in %s", path );
+ }
+ 
++extern void horizon_server_report_suspended( void (*print)( const char *line ) ) __attribute__((weak));
++
+ static void stall_watch( void *arg )
+ {
+     extern unsigned int wine_nx_gl_swaps __attribute__((weak));
+@@ -485,6 +487,7 @@ static void stall_watch( void *arg )
+         {
+             log_line( "[STALL] no frame drawn for %u s; where the threads are standing", quiet * 5 );
+             wine_nx_threads_report_stalled();
++            if (horizon_server_report_suspended) horizon_server_report_suspended( wine_nx_runtime_trace );
+             reported++;
+         }
+     }
 -- 
 2.54.0 (Apple Git-157)
 
