@@ -1,7 +1,7 @@
 From d84f31e638a1ff08ccd47d9c191277da4f67e807 Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
 Date: Wed, 28 Oct 2026 11:02:10 +0700
-Subject: [PATCH] ntdll: read another thread's i386 context on Horizon
+Subject: [PATCH 1/2] ntdll: read another thread's i386 context on Horizon
 
 A garbage collector suspends a thread and reads its context. A thread
 already blocked in a server wait parks without handing the server any
@@ -60,6 +60,49 @@ index db9a7a29..5f562379 100644
      if (!cpu) return STATUS_INVALID_PARAMETER;
      return horizon_transfer_i386_context( cpu,
                                            get_cpu_area( get_thread_data(), IMAGE_FILE_MACHINE_I386 ), ctx, FALSE );
+-- 
+2.54.0 (Apple Git-157)
+
+
+From f54b50b4380fe4e12ec285865009513de90196cd Mon Sep 17 00:00:00 2001
+From: tphuc <phuc.huynhthanh@avironactive.com>
+Date: Wed, 28 Oct 2026 12:11:39 +0700
+Subject: [PATCH 2/2] ntdll: let NtSuspendThread stop a sleeping thread on
+ Horizon
+
+A sleep on Horizon was a plain svcSleepThread, which a suspension cannot
+interrupt: a garbage collector waiting for the thread's context then
+waited as long as the sleep, forever for an infinite one. Sleep in the
+server instead, where a suspended thread parks at once.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/sync.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/ntdll/unix/sync.c b/dlls/ntdll/unix/sync.c
+index 43c5d67b..42fdf5c7 100644
+--- a/dlls/ntdll/unix/sync.c
++++ b/dlls/ntdll/unix/sync.c
+@@ -2492,11 +2492,13 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
+         extern int horizon_async_any_ready(void);
+ 
+         /* wineserver interrupts a sleeping thread with a signal to run the
+-         * socket operations that became ready for it. Horizon has no such
+-         * signal: while one is ready, a sleep waits in the server instead,
+-         * where it is handed over. The wait is not alertable, so no user APC
+-         * runs, and it lasts as long as the sleep. */
+-        if (horizon_async_any_ready())
++         * socket operations that became ready for it, or to suspend it.
++         * Horizon has no such signal, so a sleep waits in the server instead,
++         * where both are handled: NtSuspendThread then stops the thread in
++         * place rather than waiting for the sleep to end, which a garbage
++         * collector does not. The wait is not alertable, so no user APC runs,
++         * and it lasts as long as the sleep. A zero sleep only yields. */
++        if (horizon_async_any_ready() || !timeout || timeout->QuadPart)
+         {
+             if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE, timeout )) == STATUS_TIMEOUT)
+                 status = STATUS_SUCCESS;
 -- 
 2.54.0 (Apple Git-157)
 
