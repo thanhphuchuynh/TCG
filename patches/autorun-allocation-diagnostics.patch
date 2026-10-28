@@ -1,0 +1,419 @@
+diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
+--- a/dlls/ntdll/unix/horizon.c
++++ b/dlls/ntdll/unix/horizon.c
+@@ -3695,6 +3695,8 @@
+     int fd;
+     off_t file_offset;
+     BOOL write_back;
++    unsigned long long diagnostic_epoch;
++    unsigned char diagnostic_file_backed; /* fd may be closed for private/read-only views */
+ #ifdef WINE_NX_SWAP_POC
+     struct horizon_swap_entry swap;
+     unsigned char swap_private, swap_managed, swap_excluded;
+@@ -3749,6 +3751,7 @@
+  * and a page pool is not itself thread safe. */
+ static pthread_mutex_t section_pages_mutex = PTHREAD_MUTEX_INITIALIZER;
+ static struct horizon_page_pool section_pages;
++static unsigned long long section_pages_requested_bytes;
+ 
+ static void *section_pages_alloc( size_t size )
+ {
+@@ -3756,6 +3759,7 @@
+ 
+     pthread_mutex_lock( &section_pages_mutex );
+     ptr = horizon_pages_alloc_any( &section_pages, size );
++    if (ptr) section_pages_requested_bytes += size;
+     pthread_mutex_unlock( &section_pages_mutex );
+     return ptr;
+ }
+@@ -3766,6 +3770,7 @@
+ 
+     pthread_mutex_lock( &section_pages_mutex );
+     pooled = horizon_pages_free( &section_pages, ptr, size );
++    if (ptr) section_pages_requested_bytes -= size;
+     pthread_mutex_unlock( &section_pages_mutex );
+     if (!pooled) free( ptr );
+ }
+@@ -3965,6 +3970,76 @@
+ /* The mappings by address. They never overlap, so their ends are in the order
+  * of their starts. */
+ static struct rb_tree mappings = { compare_mapping, NULL };
++
++/* Observation only: no allocation, no wait on the mapping/section locks, and
++ * one charge per live backing even if it has several split views or aliases.
++ * Logical addresses, section aliases and pool spare are distinct, overlapping
++ * categories, not numbers to sum into an application RAM estimate. Backing
++ * sizes are requests; dedicated rounding and malloc overhead are not counted. */
++void horizon_memory_allocation_stats( char *buffer, size_t size )
++{
++    static unsigned long long epoch;
++    unsigned long long anon = 0, file = 0, logical = 0, reserved = 0;
++    unsigned long long section_alias = 0, section_native = 0, spare = 0, backings = 0, sections;
++    struct rb_entry *entry;
++    size_t i;
++
++    if (!size) return;
++    if (pthread_mutex_trylock( &mapping_mutex ))
++    {
++        snprintf( buffer, size, "[ALLOC] busy=mappings" );
++        return;
++    }
++    if (pthread_mutex_trylock( &section_pages_mutex ))
++    {
++        pthread_mutex_unlock( &mapping_mutex );
++        snprintf( buffer, size, "[ALLOC] busy=sections" );
++        return;
++    }
++    if (!++epoch)
++    {
++        for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
++        {
++            struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
++            if (mapping->backing) mapping->backing->diagnostic_epoch = 0;
++        }
++        epoch = 1;
++    }
++    for (entry = rb_head( mappings.root ); entry; entry = rb_next( entry ))
++    {
++        struct horizon_mapping *mapping = RB_ENTRY_VALUE( entry, struct horizon_mapping, entry );
++        struct horizon_backing *backing = mapping->backing;
++
++        logical += mapping->size;
++        if (mapping->section_state == SECTION_ALIASED) section_alias += mapping->size;
++        if (mapping->section_state == SECTION_NATIVE) section_native += mapping->size;
++        if (!backing && mapping->reservation && mapping->section_state == SECTION_NONE)
++            reserved += mapping->size;
++        if (!backing || backing->diagnostic_epoch == epoch) continue;
++        backing->diagnostic_epoch = epoch;
++        if (!backing->heap_addr) continue;
++#ifdef WINE_NX_SWAP_POC
++        if (backing->swap.detached) continue;
++#endif
++        if (backing->diagnostic_file_backed) file += backing->size;
++        else anon += backing->size;
++        backings++;
++    }
++    for (i = 0; i < backing_pages.capacity; ++i)
++        if (backing_pages.arenas[i].memory)
++            spare += (unsigned long long)backing_pages.arenas[i].free_pages * HORIZON_POOL_PAGE;
++    for (i = 0; i < section_pages.capacity; ++i)
++        if (section_pages.arenas[i].memory)
++            spare += (unsigned long long)section_pages.arenas[i].free_pages * HORIZON_POOL_PAGE;
++    sections = section_pages_requested_bytes;
++    pthread_mutex_unlock( &section_pages_mutex );
++    pthread_mutex_unlock( &mapping_mutex );
++    snprintf( buffer, size, "[ALLOC] anon_requested_bytes=%llu file_requested_bytes=%llu backings=%llu logical_bytes=%llu "
++              "reservation_bytes=%llu section_alias_bytes=%llu section_native_bytes=%llu pool_spare_bytes=%llu "
++              "section_requested_bytes=%llu end",
++              anon, file, backings, logical, reserved, section_alias, section_native, spare, sections );
++}
++
+ 
+ static int lowest_set_core( ULONG_PTR mask )
+ {
+@@ -19083,6 +19158,7 @@
+ 
+     backing->fd = -1;
+     backing->size = size;
++    backing->diagnostic_file_backed = fd != -1;
+ #ifdef WINE_NX_SWAP_POC
+     swap_pressure_locked( size );
+     if (horizon_swap_enabled()) backing->heap_addr = swap_alloc_memory( backing, size );
+diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
+--- a/horizon-wine/source/runtime.c
++++ b/horizon-wine/source/runtime.c
+@@ -1366,9 +1366,21 @@
+         {
+             extern void wine_nx_thread_report( void );
+             extern void horizon_memory_pool_stats( char *buffer, size_t size );
+-            char pool_stats[256];
++            extern void horizon_memory_allocation_stats( char *buffer, size_t size );
++            char pool_stats[640];
+             horizon_memory_pool_stats( pool_stats, sizeof(pool_stats) );
+             log_line( "%s", pool_stats );
++            horizon_memory_allocation_stats( pool_stats, sizeof(pool_stats) );
++            log_line( "%s", pool_stats );
++#ifdef WINE_NX_FEX
++            {
++                struct wine_nx_fex_jit_stats stats;
++                int error = wine_nx_fex_jit_snapshot( &stats );
++                if (error) log_line( "[JIT-ALLOC] unavailable=%d", error );
++                else log_line( "[JIT-ALLOC] arena_bytes=%zu buffer_capacity_bytes=%zu arenas=%zu buffers=%zu",
++                               stats.arena_bytes, stats.buffer_bytes, stats.arenas, stats.buffers );
++            }
++#endif
+             wine_nx_thread_report();
+         }
+         return;
+diff --git a/horizon-wine/source/fex_jit.c b/horizon-wine/source/fex_jit.c
+--- a/horizon-wine/source/fex_jit.c
++++ b/horizon-wine/source/fex_jit.c
+@@ -399,3 +399,26 @@
+     pthread_mutex_unlock( &mapping_lock );
+     return retained;
+ }
++
++int wine_nx_fex_jit_snapshot( struct wine_nx_fex_jit_stats *stats )
++{
++    const struct fex_jit_arena *arena;
++    const struct fex_jit_mapping *mapping;
++    int error;
++
++    if (!stats) return EINVAL;
++    memset( stats, 0, sizeof(*stats) );
++    if ((error = pthread_mutex_trylock( &mapping_lock ))) return error;
++    for (arena = arenas; arena; arena = arena->next)
++    {
++        stats->arena_bytes += arena->size;
++        stats->arenas++;
++    }
++    for (mapping = mappings; mapping; mapping = mapping->next)
++    {
++        stats->buffer_bytes += mapping->size;
++        stats->buffers++;
++    }
++    pthread_mutex_unlock( &mapping_lock );
++    return 0;
++}
+diff --git a/horizon-wine/source/fex_jit.h b/horizon-wine/source/fex_jit.h
+--- a/horizon-wine/source/fex_jit.h
++++ b/horizon-wine/source/fex_jit.h
+@@ -9,4 +9,13 @@
+ size_t wine_nx_fex_jit_size( const void *rx );
+ size_t wine_nx_fex_jit_release(void);
+ 
++/* Unique backing capacity; RX/RW aliases are not additive. Buffer bytes are
++ * requested capacity, not emitted code or an independent physical allocation. */
++struct wine_nx_fex_jit_stats
++{
++    size_t arena_bytes, buffer_bytes, arenas, buffers;
++};
++/* EBUSY leaves a zero snapshot; never block the progress reporter on JIT work. */
++int wine_nx_fex_jit_snapshot( struct wine_nx_fex_jit_stats *stats );
++
+ #endif
+diff --git a/horizon-wine/tests/fex_horizon_jit.c b/horizon-wine/tests/fex_horizon_jit.c
+--- a/horizon-wine/tests/fex_horizon_jit.c
++++ b/horizon-wine/tests/fex_horizon_jit.c
+@@ -137,8 +137,70 @@
+ void armDCacheFlush(void *address, size_t size) { assert(address && size); }
+ void armICacheInvalidate(void *address, size_t size) { assert(address && size); }
+ 
++static void snapshot_tests(void)
++{
++    struct wine_nx_fex_jit_stats stats;
++    void *a, *b, *rw;
++    assert(!wine_nx_fex_jit_snapshot(&stats));
++    assert(!stats.arena_bytes && !stats.buffer_bytes && !stats.arenas && !stats.buffers);
++    assert(!wine_nx_fex_jit_create(4096, &a, &rw));
++    assert(!wine_nx_fex_jit_create(8192, &b, &rw));
++    assert(!wine_nx_fex_jit_snapshot(&stats));
++    assert(stats.arena_bytes == 16u * 1024 * 1024 && stats.arenas == 1);
++    assert(stats.buffer_bytes == 12288 && stats.buffers == 2);
++    assert(!wine_nx_fex_jit_close(a));
++    assert(!wine_nx_fex_jit_snapshot(&stats));
++    assert(stats.arena_bytes == 16u * 1024 * 1024 && stats.buffer_bytes == 8192 && stats.buffers == 1);
++    pthread_mutex_lock(&mapping_lock);
++    memset(&stats, 0xff, sizeof(stats));
++    assert(wine_nx_fex_jit_snapshot(&stats) == EBUSY);
++    assert(!stats.arena_bytes && !stats.buffer_bytes && !stats.arenas && !stats.buffers);
++    pthread_mutex_unlock(&mapping_lock);
++    fail_close = 1;
++    assert(wine_nx_fex_jit_close(b) == EIO);
++    assert(!wine_nx_fex_jit_snapshot(&stats));
++    assert(stats.arena_bytes == 16u * 1024 * 1024 && stats.buffer_bytes == 8192);
++    assert(!wine_nx_fex_jit_release());
++    assert(!wine_nx_fex_jit_snapshot(&stats));
++    assert(!stats.arena_bytes && !stats.buffer_bytes && !stats.arenas && !stats.buffers);
++}
++
++static void *snapshot_worker(void *arg)
++{
++    (void)arg;
++    for (unsigned int i = 0; i < 100; ++i)
++    {
++        void *rx, *rw;
++        assert(!wine_nx_fex_jit_create(4096, &rx, &rw));
++        assert(!wine_nx_fex_jit_close(rx));
++    }
++    return NULL;
++}
++
++static void concurrent_snapshot_tests(void)
++{
++    pthread_t workers[4];
++    for (unsigned int i = 0; i < 4; ++i) assert(!pthread_create(&workers[i], NULL, snapshot_worker, NULL));
++    for (unsigned int i = 0; i < 2000; ++i)
++    {
++        struct wine_nx_fex_jit_stats stats;
++        int error = wine_nx_fex_jit_snapshot(&stats);
++        assert(!error || error == EBUSY);
++        if (!error)
++        {
++            assert(stats.buffer_bytes == stats.buffers * 4096);
++            assert(stats.buffer_bytes <= stats.arena_bytes);
++            assert(stats.arenas <= stats.buffers);
++        }
++    }
++    for (unsigned int i = 0; i < 4; ++i) assert(!pthread_join(workers[i], NULL));
++    assert(!wine_nx_fex_jit_release());
++}
++
+ int main(void)
+ {
++    snapshot_tests();
++    concurrent_snapshot_tests();
+     const size_t mb = 1024 * 1024;
+     void *rx[96], *rw, *extra, *packed;
+     size_t capacity;
+diff --git a/horizon-wine/tests/check_allocation_diagnostics.py b/horizon-wine/tests/check_allocation_diagnostics.py
+new file mode 100644
+--- /dev/null
++++ b/horizon-wine/tests/check_allocation_diagnostics.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Execute the actual horizon.c snapshot on a real mapping tree.
++Checks physical deduplication, read-only file classification, logical reservations,
++section aliases, stale freed slots, busy locks and bounded output. No kernel API
++is called by this observer, so a small real-tree host fixture is sufficient.
++"""
++from pathlib import Path
++import re, subprocess, tempfile
++root = Path(__file__).resolve().parents[2]
++s = (root / 'dlls/ntdll/unix/horizon.c').read_text()
++def function(prefix):
++    m = re.search('^' + re.escape(prefix) + r'[^;{]*?\)\s*\n\{', s, re.M | re.S)
++    assert m, 'missing observer: ' + prefix
++    i, depth = m.end(), 1
++    while depth:
++        depth += (s[i] == '{') - (s[i] == '}')
++        i += 1
++    return s[m.start():i] + '\n'
++def block(pattern):
++    m = re.search(pattern, s, re.M | re.S)
++    assert m, pattern
++    return m.group(0) + '\n'
++fixture = r'''
++#include <assert.h>
++#include <errno.h>
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include "wine/rbtree.h"
++#include "horizon_pool.h"
++typedef int BOOL;
++typedef void VirtmemReservation;
++static pthread_mutex_t mapping_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_mutex_t section_pages_mutex = PTHREAD_MUTEX_INITIALIZER;
++static struct horizon_page_pool backing_pages, section_pages;
++static unsigned long long section_pages_requested_bytes;
++'''
++fixture += block(r'struct horizon_backing\n\{.*?\n\};')
++fixture += block(r'enum horizon_section_state\n\{.*?\n\};')
++fixture += block(r'struct horizon_mapping\n\{.*?\n\};')
++fixture += function('static void *section_pages_alloc')
++fixture += function('static void section_pages_free')
++fixture += function('static int compare_mapping')
++fixture += 'static struct rb_tree mappings = { compare_mapping, NULL };\n'
++fixture += function('void horizon_memory_allocation_stats')
++fixture += r'''
++static void expect(const char *line, const char *field, unsigned long long value)
++{
++    char expected[96];
++    snprintf(expected, sizeof(expected), "%s=%llu ", field, value);
++    if (!strstr(line, expected)) { fprintf(stderr, "missing %s in %s\n", expected, line); abort(); }
++}
++int main(void)
++{
++    void *small = section_pages_alloc(4096);
++    void *large = section_pages_alloc(3u * 1024 * 1024);
++    assert(small && large && section_pages_requested_bytes == 4096u + 3u * 1024 * 1024);
++    assert(!section_pages_alloc(0));
++    assert(section_pages_requested_bytes == 4096u + 3u * 1024 * 1024);
++    section_pages_free(small, 4096);
++    assert(section_pages_requested_bytes == 3u * 1024 * 1024);
++    section_pages_free(large, 3u * 1024 * 1024);
++    assert(!section_pages_requested_bytes);
++    horizon_pages_trim(&section_pages);
++    char line[640], tiny[2] = {'x','y'};
++    /* One anonymous backing split across two aliases, and one read-only file
++     * backing (no retained fd, unlike writable shared mappings). */
++    struct horizon_backing backing[3] = {
++        {.heap_addr=(void *)1, .size=12288, .refs=2, .fd=-1},
++        {.heap_addr=(void *)2, .size=8192, .refs=1, .fd=-1, .diagnostic_file_backed=1},
++        {.heap_addr=(void *)3, .size=999999, .refs=1, .fd=-1}
++    };
++    struct horizon_mapping views[6] = {
++        {.addr=(void *)0x10000, .size=4096, .backing=&backing[0]},
++        {.addr=(void *)0x20000, .size=8192, .backing=&backing[0]},
++        {.addr=(void *)0x30000, .size=8192, .backing=&backing[1]},
++        {.addr=(void *)0x40000, .size=65536, .reservation=(void *)1},
++        {.addr=(void *)0x60000, .size=4096, .section_state=SECTION_ALIASED},
++        {.addr=(void *)0x70000, .size=8192, .section_state=SECTION_NATIVE}
++    };
++    struct horizon_page_arena bp = {.memory=(void *)1, .free_pages=3};
++    struct horizon_page_arena sp = {.memory=(void *)2, .free_pages=7};
++    backing_pages.arenas=&bp; backing_pages.capacity=1;
++    section_pages.arenas=&sp; section_pages.capacity=1;
++    section_pages_requested_bytes=65536; /* descriptor-owned backing exceeds active view */
++    for (unsigned int i=0; i<6; ++i) assert(!rb_put(&mappings, views[i].addr, &views[i].entry));
++    for (unsigned int repeat=0; repeat<3; ++repeat)
++    {
++        horizon_memory_allocation_stats(line, sizeof(line));
++        expect(line, "anon_requested_bytes", 12288);
++        expect(line, "file_requested_bytes", 8192);
++        expect(line, "backings", 2);
++        expect(line, "logical_bytes", 98304);
++        expect(line, "reservation_bytes", 65536);
++        expect(line, "section_alias_bytes", 4096);
++        expect(line, "section_native_bytes", 8192);
++        expect(line, "pool_spare_bytes", 40960);
++        expect(line, "section_requested_bytes", 65536);
++    }
++    /* Freed-slot metadata must never appear in a live snapshot. */
++    rb_remove(&mappings, &views[2].entry);
++    horizon_memory_allocation_stats(line, sizeof(line));
++    expect(line, "file_requested_bytes", 0); expect(line, "backings", 1);
++    pthread_mutex_lock(&mapping_mutex);
++    horizon_memory_allocation_stats(line, sizeof(line));
++    assert(!strcmp(line, "[ALLOC] busy=mappings"));
++    pthread_mutex_unlock(&mapping_mutex);
++    pthread_mutex_lock(&section_pages_mutex);
++    horizon_memory_allocation_stats(line, sizeof(line));
++    assert(!strcmp(line, "[ALLOC] busy=sections"));
++    assert(!pthread_mutex_trylock(&mapping_mutex));
++    pthread_mutex_unlock(&mapping_mutex);
++    pthread_mutex_unlock(&section_pages_mutex);
++    horizon_memory_allocation_stats(tiny, sizeof(tiny));
++    assert(tiny[1] == 0);
++    horizon_memory_allocation_stats(NULL, 0);
++    puts("Allocation snapshot: alias dedup, file/private, stale slots, logical reservations, sections, pool spare, trylocks and bounds passed");
++}
++'''
++with tempfile.TemporaryDirectory() as td:
++    src, exe = Path(td)/'test.c', Path(td)/'test'
++    src.write_text(fixture)
++    subprocess.run(['clang','-g','-Wall','-Wextra','-Werror','-pthread','-fsanitize=address,undefined',
++        '-I'+str(root/'include'),'-I'+str(root/'dlls/ntdll/unix'),str(src),'-o',str(exe)],check=True)
++    subprocess.run([str(exe)],check=True)
+diff --git a/horizon-wine/check-allocation-diagnostics.sh b/horizon-wine/check-allocation-diagnostics.sh
+new file mode 100644
+--- /dev/null
++++ b/horizon-wine/check-allocation-diagnostics.sh
+@@ -0,0 +1,12 @@
++#!/bin/sh
++# Observer tests execute own Autorun host bridge, not FEX upstream code.
++set -eu
++root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
++build="$(mktemp -d "${TMPDIR:-/tmp}/wine-nx-allocation.XXXXXX")"
++trap 'rm -rf "$build"' EXIT HUP INT TERM
++cc="${CC:-clang}"
++"$cc" -g -Wall -Wextra -Werror -pthread -fsanitize=address,undefined \
++    -D__SWITCH__ -I"$root/horizon-wine/tests/fex_horizon" \
++    "$root/horizon-wine/tests/fex_horizon_jit.c" -o "$build/jit"
++"$build/jit"
++python3 "$root/horizon-wine/tests/check_allocation_diagnostics.py"
