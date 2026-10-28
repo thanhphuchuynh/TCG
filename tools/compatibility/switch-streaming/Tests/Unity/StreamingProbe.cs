@@ -61,9 +61,41 @@ public sealed class StreamingProbe : MonoBehaviour
         manifest.entries.Add(new ArtEntry { key = "monster:2:icon:0", bundle = "art_red", asset = "assets/streamingfixtures/red-sprite.asset", bytes = 256, crc = RedCrc });
         manifest.entries.Add(new ArtEntry { key = "monster:3:icon:0", bundle = "art_blue", asset = "assets/streamingfixtures/blue-sprite.asset", bytes = 256, crc = BlueCrc });
         manifest.entries.Add(new ArtEntry { key = "monster:4:icon:0", bundle = "art_missing", asset = "assets/streamingfixtures/missing.asset", bytes = 256, crc = 0 });
+        manifest.entries.Add(new ArtEntry { key = "monster:5:icon:0", bundle = "art_wrongsize", asset = "assets/streamingfixtures/blue-sprite.asset", bytes = 512, crc = BlueCrc });
         var service = new GameObject("Local bundle service").AddComponent<UnityArtService>();
         service.Initialize(BundleRoot, manifest, LoadingSprite, 0);
         service.TraceOwnership = true;
+        var resident = View("resident card without relocated artwork");
+        using (CardArtSession.Begin(resident, () => { }, false)) { resident.Target.sprite = LoadingSprite; }
+        Check(resident.GetComponent<CanvasGroup>().alpha == 1 && service.Cache.PendingCount == 0, "Resident artwork was hidden by an empty streaming session");
+        Destroy(resident.gameObject); passed++;
+        var pack = View("pack prepared while hidden"); pack.gameObject.SetActive(false); pack.Render(1);
+        CardArtSession.Prime(pack);
+        float packDeadline = Time.realtimeSinceStartup + 20;
+        while (!CardArtSession.Ready(pack) && Time.realtimeSinceStartup < packDeadline) yield return null;
+        Check(CardArtSession.Ready(pack) && service.Cache.PinnedBytes == 256 && pack.Target.sprite == LoadingSprite, "Pack prime did not retain hidden upcoming artwork");
+        pack.Render(3); CardArtSession.Prime(pack); packDeadline = Time.realtimeSinceStartup + 20;
+        while (!CardArtSession.Ready(pack) && Time.realtimeSinceStartup < packDeadline) yield return null;
+        Check(CardArtSession.Ready(pack) && service.Cache.PinnedBytes == 256, "Rebound hidden pack retained old preload pins");
+        pack.gameObject.SetActive(true); packDeadline = Time.realtimeSinceStartup + 20;
+        while (!ColorIs(pack.Target.sprite, Color.blue) && Time.realtimeSinceStartup < packDeadline) yield return null;
+        Check(ColorIs(pack.Target.sprite, Color.blue) && service.Cache.PinnedBytes == 256, "Pack reveal did not transfer the preload lease");
+        pack.gameObject.SetActive(false); CardArtSession.Prime(pack); CardArtSession.CancelPrime(pack);
+        packDeadline = Time.realtimeSinceStartup + 20;
+        while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < packDeadline) yield return null;
+        service.Cache.TrimAllUnpinned(); Check(service.Cache.PinnedBytes == 0 && service.Cache.LoadedBytes == 0, "Cancelled pack retained artwork");
+        Destroy(pack.gameObject); passed++;
+        var page = new GameObject("album page");
+        var pageA = View("page first card"); var pageB = View("page second card");
+        pageA.transform.SetParent(page.transform, false); pageB.transform.SetParent(page.transform, false);
+        pageA.Render(1); pageB.Render(3);
+        ArtPageGate.Watch(page.transform, new Component[] { pageA, pageB });
+        Check(page.GetComponent<CanvasGroup>().alpha == 0, "Album exposed an incomplete page");
+        float pageDeadline = Time.realtimeSinceStartup + 20;
+        while (page.GetComponent<CanvasGroup>().alpha == 0 && Time.realtimeSinceStartup < pageDeadline) yield return null;
+        Check(page.GetComponent<CanvasGroup>().alpha == 1 && ColorIs(pageA.Target.sprite, Color.red) && ColorIs(pageB.Target.sprite, Color.blue), "Album page appeared before all authored artwork was bound");
+        page.SetActive(false); Destroy(page); yield return null;
+        service.Cache.TrimAllUnpinned(); Check(service.Cache.PinnedBytes == 0, "Closed album page retained pins"); passed++;
         var distant = View("initially culled world card");
         distant.Monster = 1;
         using (CardArtSession.Begin(distant, () => distant.Render(1), false))
@@ -134,6 +166,15 @@ public sealed class StreamingProbe : MonoBehaviour
         while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < deadline) yield return null;
         Check(!string.IsNullOrEmpty(service.LastError), "Missing local file did not report error");
         b.gameObject.SetActive(false); Check(service.Cache.PinnedBytes == 0, "Failed artwork retained pins"); passed++;
-        Destroy(b.gameObject);
+        b.gameObject.SetActive(true); b.Render(5); deadline = Time.realtimeSinceStartup + 20;
+        while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < deadline) yield return null;
+        Check(service.LastError != null && service.LastError.Contains("size") && !CardArtSession.Displayed(b), "Bundle manifest byte mismatch was accepted");
+        b.gameObject.SetActive(false); Check(service.Cache.PinnedBytes == 0, "Size mismatch retained pins"); passed++;
+        Destroy(b.gameObject); yield return null;
+        Destroy(service.gameObject); yield return null;
+        Check(UnityArtService.Available, "A missing external manifest disabled required streaming and allowed resident fallback");
+        bool missingManifest = false;
+        try { var required = UnityArtService.Instance; } catch (Exception) { missingManifest = true; }
+        Check(missingManifest, "Missing external content manifest was accepted"); passed++;
     }
 }

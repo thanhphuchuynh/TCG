@@ -29,6 +29,20 @@ namespace TCG.SwitchStreaming
     public sealed class UnityArtService : MonoBehaviour
     {
         static UnityArtService instance;
+        static TextAsset residentManifest;
+        static bool checkedResidentManifest;
+        static TextAsset ResidentManifest
+        {
+            get
+            {
+                if (!checkedResidentManifest)
+                {
+                    residentManifest = Resources.Load<TextAsset>("TCGStreaming/Catalog");
+                    checkedResidentManifest = true;
+                }
+                return residentManifest;
+            }
+        }
         Dictionary<string, ArtEntry> entries;
         Dictionary<string, ArtEntry> bundles;
         string root;
@@ -40,7 +54,7 @@ namespace TCG.SwitchStreaming
         public void Trace(string message) { if (TraceOwnership) Debug.Log("[STREAMING-OWNER] frame=" + Time.frameCount + " " + message); }
         public static bool Available
         {
-            get { return instance && instance.entries != null || File.Exists(Path.Combine(Application.streamingAssetsPath, "TCGStreamedArt/catalog.json")); }
+            get { return instance && instance.entries != null || ResidentManifest || File.Exists(Path.Combine(Application.streamingAssetsPath, "TCGStreamedArt/catalog.json")); }
         }
         public static UnityArtService Instance
         {
@@ -49,10 +63,16 @@ namespace TCG.SwitchStreaming
                 if (!instance) new GameObject("Local artwork cache").AddComponent<UnityArtService>();
                 if (instance.entries == null)
                 {
-                    string path = Path.Combine(Application.streamingAssetsPath, "TCGStreamedArt");
-                    var manifest = JsonUtility.FromJson<ArtManifest>(File.ReadAllText(Path.Combine(path, "catalog.json")));
-                    var placeholder = Resources.Load<Sprite>(manifest.loadingResource);
-                    instance.Initialize(path, manifest, placeholder, 128L * 1024 * 1024);
+                    try
+                    {
+                        string path = Path.Combine(Application.streamingAssetsPath, "TCGStreamedArt");
+                        string json = File.ReadAllText(Path.Combine(path, "catalog.json"));
+                        if (ResidentManifest && json != ResidentManifest.text) throw new InvalidDataException("Local artwork manifest does not match this build");
+                        var manifest = JsonUtility.FromJson<ArtManifest>(json);
+                        var placeholder = Resources.Load<Sprite>(manifest.loadingResource);
+                        instance.Initialize(path, manifest, placeholder, 128L * 1024 * 1024);
+                    }
+                    catch (Exception error) { instance.ReportError(error.Message); throw; }
                 }
                 return instance;
             }
@@ -90,6 +110,21 @@ namespace TCG.SwitchStreaming
             if (!bundle) { done(null, "Could not load local artwork bundle: " + key); yield break; }
             var sprites = bundle.LoadAllAssetsAsync<Sprite>();
             yield return sprites;
+            string invalid = null;
+            try
+            {
+                var textures = new HashSet<int>(); long imageBytes = 0;
+                foreach (var asset in sprites.allAssets)
+                {
+                    var sprite = asset as Sprite;
+                    if (!sprite || !sprite.texture) throw new InvalidDataException("Missing authored bundle Sprite");
+                    if (sprite.associatedAlphaSplitTexture) throw new InvalidDataException("Unexpected split artwork texture");
+                    if (textures.Add(sprite.texture.GetInstanceID())) imageBytes += ArtImageSize.Of(sprite.texture);
+                }
+                if (textures.Count != 1 || imageBytes != entry.bytes) throw new InvalidDataException("Artwork size disagrees with local manifest: " + key);
+            }
+            catch (Exception error) { invalid = error.Message; }
+            if (invalid != null) { bundle.Unload(true); done(null, invalid); yield break; }
             done(new LoadedArtBundle(bundle), null);
         }
         public void ReportError(string error)

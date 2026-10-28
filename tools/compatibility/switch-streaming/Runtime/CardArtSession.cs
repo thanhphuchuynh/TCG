@@ -26,6 +26,7 @@ namespace TCG.SwitchStreaming
             public Action Refresh;
             public Frame Frame;
             public readonly Dictionary<string, ArtCache<LoadedArtBundle>.Lease> Warm = new Dictionary<string, ArtCache<LoadedArtBundle>.Lease>();
+            public readonly Dictionary<string, ArtCache<LoadedArtBundle>.Lease> Primed = new Dictionary<string, ArtCache<LoadedArtBundle>.Lease>();
         }
         sealed class Frame
         {
@@ -49,8 +50,10 @@ namespace TCG.SwitchStreaming
                 ended = true; current = previous; frame.Building = false;
                 ClearImages(frame.State, old, frame.Leases);
                 Release(old);
-                if (frame.Suppressed || frame.Pending > 0 || frame.Error != null) Hide(frame.State);
+                PrunePreloads(frame);
+                if (frame.Suppressed && frame.Keys.Count > 0 || frame.Pending > 0 || frame.Error != null) Hide(frame.State);
                 else Show(frame.State);
+                if (!frame.Suppressed && frame.Pending == 0 && frame.Error == null) Release(frame.State.Primed);
                 Finish(frame);
             }
         }
@@ -153,6 +156,22 @@ namespace TCG.SwitchStreaming
             foreach (var lease in leases.Values) lease.Dispose();
             leases.Clear();
         }
+        static void PrunePreloads(Frame frame)
+        {
+            var needed = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string key in frame.Keys)
+            {
+                ArtEntry entry;
+                if (UnityArtService.Instance.Find(key, out entry)) needed.Add(entry.bundle);
+            }
+            foreach (var leases in new[] { frame.State.Primed, frame.State.Warm })
+            {
+                var removed = new List<string>();
+                foreach (var pair in leases)
+                    if (!needed.Contains(pair.Key)) { pair.Value.Dispose(); removed.Add(pair.Key); }
+                foreach (string key in removed) leases.Remove(key);
+            }
+        }
 
         public static void Disable(Component owner) { if (owner) DisableById(owner.GetInstanceID()); }
         internal static void DisableById(int id)
@@ -163,6 +182,7 @@ namespace TCG.SwitchStreaming
             Hide(state);
             if (state.Frame != null) { ClearImages(state, state.Frame.Leases, null); Release(state.Frame.Leases); }
             Release(state.Warm);
+            Release(state.Primed);
         }
         public static void Reactivate(Component owner) { if (owner) ReactivateById(owner.GetInstanceID()); }
         internal static void ReactivateById(int id)
@@ -193,6 +213,45 @@ namespace TCG.SwitchStreaming
                 if (lease.Ready) lease.Dispose();
                 else if (!completed) state.Warm[entry.bundle] = lease;
             }
+        }
+        public static void Prime(Component owner)
+        {
+            if (!owner || !UnityArtService.Available) return; State state;
+            if (!owners.TryGetValue(owner.GetInstanceID(), out state) || state.Frame == null) return;
+            var service = UnityArtService.Instance;
+            foreach (string key in state.Frame.Keys)
+            {
+                ArtEntry entry;
+                if (!service.Find(key, out entry) || state.Primed.ContainsKey(entry.bundle)) continue;
+                var lease = service.Acquire(entry, ready => { if (ready.Error != null) service.ReportError(ready.Error); });
+                state.Primed.Add(entry.bundle, lease);
+                if (lease.Ready && lease.Error != null) service.ReportError(lease.Error);
+            }
+        }
+        public static bool Ready(Component owner)
+        {
+            if (!owner || !UnityArtService.Available) return true; State state;
+            if (!owners.TryGetValue(owner.GetInstanceID(), out state) || state.Frame == null) return true;
+            var service = UnityArtService.Instance;
+            foreach (string key in state.Frame.Keys)
+            {
+                ArtEntry entry;
+                if (!service.Find(key, out entry)) continue;
+                ArtCache<LoadedArtBundle>.Lease lease;
+                if (!state.Frame.Leases.TryGetValue(entry.bundle, out lease) && !state.Primed.TryGetValue(entry.bundle, out lease)) return false;
+                if (!lease.Ready || lease.Error != null || lease.Value == null) return false;
+            }
+            return true;
+        }
+        public static void CancelPrime(Component owner)
+        {
+            if (!owner) return; State state;
+            if (owners.TryGetValue(owner.GetInstanceID(), out state)) Release(state.Primed);
+        }
+        public static bool Displayed(Component owner)
+        {
+            if (!owner || !UnityArtService.Available) return true; State state;
+            return !owners.TryGetValue(owner.GetInstanceID(), out state) || !state.Hidden;
         }
         internal static void Forget(int id)
         {
