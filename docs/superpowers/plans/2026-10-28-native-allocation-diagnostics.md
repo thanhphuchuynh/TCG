@@ -50,3 +50,13 @@ physical heap and non-Heap types, mark partial queries explicitly. This measures
 registered source pages rather than live texture bytes or a complete RAM total.
 The device scan's complete flag means traversal reached the heap end; concurrent
 mapping changes mean this is not an atomic snapshot of all attributes.
+
+All three native diagnostic revisions passed the SDK, sanitizer observer/bridge,
+and ARM64 dispatcher jobs. The final device metadata observer reaches title, but
+Ryujinx's NvMap allocation implementation does not set the DeviceMapped kernel
+attribute. Its zero is therefore not usable as a GPU allocation measurement here.
+Existing emulator ServiceNv logs at title record219 creates/219 successful allocs,
+one deleted map and479.5 MiB of live map requests. These are logical requests,
+not a union of physical source pages. Gameplay-side NvMap measurements remain
+pending because macOS locked and blocks desktop input. Temporary emulator debug
+logging was restored. 4 GiB gameplay acceptance remains unmet; no fullgame release.
