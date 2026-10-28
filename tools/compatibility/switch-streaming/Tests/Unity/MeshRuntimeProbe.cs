@@ -6,7 +6,8 @@ using UnityEngine;
 
 public sealed class MeshRuntimeProbe : MonoBehaviour
 {
-    public string BundleRoot;
+    public string BundleRoot, NestedBodyKey;
+    public GameObject NestedBodyPrefab;
     public uint Crc, SecondCrc, BadPayloadCrc;
     const string First = "mesh:11111111111111111111111111111111", Second = "mesh:22222222222222222222222222222222";
     int passed;
@@ -128,5 +129,27 @@ public sealed class MeshRuntimeProbe : MonoBehaviour
         var requiredService = MeshService.Instance;
         using (var lease = requiredService.Acquire(First)) Check(lease.Ready && lease.Value != null && lease.Value.Mesh.blendShapeCount == 1, "Exact canonical local manifest failed to initialize authored mesh");
         requiredService.Cache.TrimAllUnpinned(); Destroy(requiredService.gameObject); passed++;
+        yield return null;
+        var nestedManifest = new MeshManifest();
+        nestedManifest.entries.Add(new MeshEntry { key = NestedBodyKey, bundle = "mesh_rigged", asset = First, bytes = 1024, crc = Crc });
+        var nestedService = new GameObject("nested body cache").AddComponent<MeshService>(); nestedService.Initialize(BundleRoot, nestedManifest, 0);
+        var nestedClone = UnityEngine.Object.Instantiate(NestedBodyPrefab);
+        var customizer = nestedClone.GetComponentInChildren<CC.CharacterCustomization>(true);
+        Check(!nestedClone.activeSelf && customizer && !customizer.MainMesh.sharedMesh, "Nested inactive fixture started with eager body");
+        customizer.Initialize();
+        Check(customizer.Parses == 1 && customizer.MainMesh.sharedMesh && customizer.MainMesh.GetBlendShapeWeight(0) == 61 &&
+            !nestedClone.GetComponent<MeshBundleOwner>() && customizer.GetComponent<MeshBundleOwner>(), "First nested initialization lost exact owner or setup");
+        yield return null; yield return null;
+        Check(!customizer.MainMesh.sharedMesh && nestedService.Cache.PinnedBytes == 0, "Nested inactive first initialization retained pins");
+        customizer.Initialize();
+        Check(customizer.Parses == 1 && customizer.Reloads == 1 && customizer.MainMesh.GetBlendShapeWeight(0) == 81, "Nested inactive reused setup failed");
+        yield return null; yield return null;
+        Check(!customizer.MainMesh.sharedMesh && nestedService.Cache.PinnedBytes == 0, "Nested inactive reuse retained pins");
+        nestedClone.SetActive(true);
+        Check(customizer.MainMesh.sharedMesh && customizer.MainMesh.GetBlendShapeWeight(0) == 81 && customizer.MainMesh.bones[0] == customizer.transform,
+            "Nested later activation lost initialized appearance or rig");
+        nestedClone.SetActive(false); Check(!customizer.MainMesh.sharedMesh && nestedService.Cache.PinnedBytes == 0, "Nested disable retained owned mesh");
+        Destroy(nestedClone); Destroy(nestedService.gameObject); yield return null; passed++;
+
     }
 }

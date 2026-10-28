@@ -8,7 +8,10 @@ playable Switch port.
 `prepare_project.py PROJECT` backs up and applies guarded ownership hooks in the
 private recovered project. It computes every replacement before writing sources
 and is safe to repeat. Also run `prepare_character_meshes.py PROJECT` for the two
-guarded character-part Instantiate hooks. Copy Runtime and Editor sources into
+guarded character-part Instantiate hooks and root preparation before either
+original Initialize branch. Its version2 receipt validates raw source/backup hashes;
+a legacy receipt upgrades only when the old transform exactly recreates its recorded source.
+Copy Runtime and Editor sources into
 the project. Also run `prepare_surfaces.py PROJECT` for the 24 original shop
 finish setters. All three preparation receipts are required by the combined build.
 
@@ -28,6 +31,18 @@ preserved; prefab names, choice lists and materials remain resident. One Mesh pe
 LZ4 bundle is acquired synchronously before the original appearance setup. Disable
 clears references before unpinning; reenable restores current appearance data.
 The 128 MiB mesh cache budget is a soft accounting estimate, not measured headroom.
+
+Eight audited body meshes use the same cache. `BodyMeshBuild` audits all incoming
+references, binds six prefabs under a whole-batch recovery journal, and converts
+224 scene renderer slots on56 customizer roots only during the player build.
+The source Start scene stays byte-identical. Unrelated built-in meshes remain
+resident. Full retries restore body state before regenerating the choice manifest;
+preparation runs after art, choices and finishes. Body bundles build in a separate
+staging folder; hashes of the252 existing bundles must remain unchanged.
+Incremental player builders must call `BeginPlayerBuild()` before BuildPlayer and
+`CompletePlayerBuild()` after success. Missing/stale callback proof rejects the build.
+The combined catalogue contains260 meshes; cold loads remain synchronous and
+still require gameplay frame-time measurements.
 
 Unity's mesh-only bundle pipeline resets `m_MeshUsageFlags`; the build restores the
 exact captured source value with `preserve_mesh_flags.py`. It does not infer flag
@@ -80,12 +95,19 @@ Duplicate authored names require complete per-name payload-set coverage; baselin
 player files do not identify source GUIDs. The controlled builder enforces source
 GUID/address/renderer association separately. This limitation is in each report.
 Run both artwork and mesh audits; neither establishes emulator/hardware gameplay.
+For a body-streamed player, supply `--body-report body-mesh-build.json` as well.
+The validator requires all eight original paths and native scene/bundle fidelity
+proof before checking all260 bundles against the original direct player.
 
 Additional actual Unity entry points are `MeshRuntimeTests.Run`,
 `TCG.SwitchStreaming.Tests.MeshReferenceAuditTests.Run`, `CharacterBuildTests.Run`
 and `CharacterRestoreTests.Run`; use separate fixture
 projects so their generated assets never enter the game. Preservation tests need
 UnityPy and the synthetic mesh fixture (`TCG_MESH_FIXTURES` points at its project).
+The mesh runtime fixture also needs `Tests/Unity/BodyRuntime/CharacterCustomization.cs`
+as Assets/CharacterCustomization.cs and the body editor helpers. This minimal
+CC component is test-only: never copy it into the recovered game. Its nested
+prefab exercises inactive first/reused initialization and later activation.
 
 Finish textures use `SurfaceTextures.SetTexture` and a 64 MiB soft cache. The
 original data getter runs first; the hook maps its actual returned list index,

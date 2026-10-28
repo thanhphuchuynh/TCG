@@ -23,7 +23,18 @@ namespace TCG.SwitchStreaming.Editor
         };
         [Serializable] public sealed class FileSnapshot { public string path, guid, originalSha256, preparedSha256; }
         [Serializable] sealed class MeshStamp { public string path, guid, sha256; }
+        [Serializable] sealed class CharacterReceipt { public int version; public string source, backup, baselineSha256, preparedSha256, sha256; }
         [Serializable] sealed class BundleStamp { public string name, sha256; }
+        [Serializable] public sealed class SceneProof { public string token, path, sourceSha256; public int bindings, owners; }
+        [Serializable] sealed class Report
+        {
+            public string status = "prepared";
+            public List<MeshRecord> eligible;
+            public int bundleCount = 8, prefabCount = 6, previousBundleCount = 252, sceneBindingCount, sceneOwnerCount;
+            public bool sourceSceneUnchanged, previousBundlesUnchanged;
+            public List<string> retained = new List<string>();
+        }
+        static string buildToken;
         [Serializable] sealed class Journal
         {
             public int version = 1;
@@ -38,10 +49,25 @@ namespace TCG.SwitchStreaming.Editor
         static string Root { get { return Path.GetDirectoryName(Project); } }
         static string JournalPath { get { return Path.Combine(Root, "body-mesh-journal.json"); } }
         static string Backups { get { return Path.Combine(Root, "body-mesh-backup"); } }
+        static string ProofPath { get { return Path.Combine(Root, "body-scene-build-proof.json"); } }
         static void Guard()
         {
             if (Path.GetFileName(Project) != "macos-port-work" || Path.GetFileName(Root) != "switch-on-demand" || !File.Exists(Path.Combine(Project, "character-mesh-preparation.json")))
                 throw new InvalidOperationException("Body preparation requires the private prepared on-demand clone");
+            ValidateCharacterReceipt(Project);
+        }
+        public static void ValidateCharacterReceipt(string project)
+        {
+            project = Path.GetFullPath(project);
+            string source = Path.Combine(project, "Assets/Scripts/Assembly-CSharp/CC/CharacterCustomization.cs");
+            string backup = Path.Combine(Path.GetDirectoryName(project), "character-mesh-source-backup/CharacterCustomization.cs");
+            string path = Path.Combine(project, "character-mesh-preparation.json");
+            if (!File.Exists(path)) throw new InvalidOperationException("Run current character source preparation before body migration");
+            var receipt = JsonUtility.FromJson<CharacterReceipt>(File.ReadAllText(path));
+            if (receipt == null || receipt.version != 2 || receipt.source != source || receipt.backup != backup ||
+                !File.Exists(source) || !File.Exists(backup) || receipt.sha256 != receipt.preparedSha256 ||
+                Hash(source) != receipt.preparedSha256 || Hash(backup) != receipt.baselineSha256)
+                throw new InvalidOperationException("Current root initialization hook/source receipt is missing or changed");
         }
         public static string Hash(string path)
         {
@@ -163,6 +189,19 @@ namespace TCG.SwitchStreaming.Editor
             }
             return records.OrderBy(r => r.guid, StringComparer.Ordinal).ToList();
         }
+        public static void RewritePrefab(BodySource source, IList<MeshRecord> records)
+        {
+            if (source == null || !source.path.EndsWith(".prefab", StringComparison.Ordinal) ||
+                source.guid != AssetDatabase.AssetPathToGUID(source.path) || source.sha256 != Hash(source.path))
+                throw new InvalidOperationException("Body prefab identity/hash changed");
+            var root = PrefabUtility.LoadPrefabContents(source.path);
+            try
+            {
+                RewriteOwners(new[] { root }, source, records);
+                if (!PrefabUtility.SaveAsPrefabAsset(root, source.path)) throw new IOException("Could not save audited body prefab");
+            }
+            finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
         public static void Prepare()
         {
             Guard();
@@ -202,7 +241,7 @@ namespace TCG.SwitchStreaming.Editor
             records = Reload(records);
             foreach (var row in journal.files.Where(f => f.path.EndsWith(".prefab", StringComparison.Ordinal)))
             {
-                CharacterMeshBuild.RewritePrefab(row.path, records); row.preparedSha256 = Hash(row.path); Save(journal);
+                RewritePrefab(audit.sources.Single(s => s.path == row.path), records); row.preparedSha256 = Hash(row.path); Save(journal);
             }
             string combined = JsonUtility.ToJson(manifest, true);
             foreach (var row in journal.files.Where(f => !f.path.EndsWith(".prefab", StringComparison.Ordinal)))
@@ -212,12 +251,45 @@ namespace TCG.SwitchStreaming.Editor
             AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport); VerifyPrevious(journal, output);
             if (Hash(ScenePath) != sceneSource.sha256) throw new InvalidOperationException("Source scene changed during preparation");
             journal.phase = "prepared"; Save(journal);
+            WriteReport(journal, null);
             Debug.Log("[BODY-BUILD] Prepared eight exact meshes, six prefabs and260-entry catalogue; scene remains unchanged");
+        }
+        public static void BeginPlayerBuild() { buildToken = System.Guid.NewGuid().ToString("N"); }
+        public static SceneProof VerifyPlayerBuild(string scenePath, int bindings, int owners)
+        {
+            if (String.IsNullOrEmpty(buildToken) || !File.Exists(ProofPath)) throw new InvalidOperationException("No current body scene build proof");
+            var proof = JsonUtility.FromJson<SceneProof>(File.ReadAllText(ProofPath));
+            if (proof == null || proof.token != buildToken || proof.path != scenePath || proof.sourceSha256 != Hash(scenePath) || proof.bindings != bindings || proof.owners != owners)
+                throw new InvalidOperationException("Body scene build proof is stale, incomplete or changed");
+            return proof;
+        }
+        static void WriteReport(Journal journal, SceneProof proof)
+        {
+            VerifyPrevious(journal, Path.GetDirectoryName(Local));
+            var scene = journal.audit.sources.Single(s => s.path == ScenePath);
+            var report = new Report { eligible = journal.records, sourceSceneUnchanged = Hash(ScenePath) == scene.sha256,
+                previousBundlesUnchanged = true, sceneBindingCount = proof == null ? 0 : proof.bindings, sceneOwnerCount = proof == null ? 0 : proof.owners };
+            File.WriteAllText(Path.Combine(Root, "body-mesh-build.json"), JsonUtility.ToJson(report, true));
+        }
+        public static void CompletePlayerBuild()
+        {
+            Guard(); var journal = Read(); ValidateFiles(Backups, journal.files);
+            if (journal.phase != "prepared" || journal.files.Any(f => String.IsNullOrEmpty(f.preparedSha256) || Hash(f.path) != f.preparedSha256)) throw new InvalidOperationException("Body preparation changed during player build");
+            WriteReport(journal, VerifyPlayerBuild(ScenePath, 224, 56));
         }
         public static void RewriteScene(Scene scene, BodySource source, IList<MeshRecord> records)
         {
             if (source == null || source.path != scene.path || source.guid != AssetDatabase.AssetPathToGUID(source.path) || source.sha256 != Hash(source.path)) throw new InvalidOperationException("Body scene identity/hash changed");
-            var roots = scene.GetRootGameObjects(); var actual = BodyMeshReferenceAudit.Inspect(roots, records, source.slots.GroupBy(s => s.ownerPath).First().Count());
+            RewriteOwners(scene.GetRootGameObjects(), source, records);
+            if (Hash(source.path) != source.sha256) throw new InvalidOperationException("Body conversion wrote source scene");
+            if (!String.IsNullOrEmpty(buildToken)) File.WriteAllText(ProofPath, JsonUtility.ToJson(new SceneProof {
+                token = buildToken, path = source.path, sourceSha256 = source.sha256, bindings = source.slots.Count,
+                owners = source.slots.Select(s => s.ownerPath).Distinct().Count() }, true));
+        }
+        static void RewriteOwners(GameObject[] roots, BodySource source, IList<MeshRecord> records)
+        {
+            if (source.slots == null || source.slots.Count == 0) throw new InvalidOperationException("Empty body ownership proof");
+            var actual = BodyMeshReferenceAudit.Inspect(roots, records, source.slots.GroupBy(s => s.ownerPath).First().Count());
             Func<BodySlot, string> key = s => s.ownerPath + ":" + s.rendererPath + ":" + s.meshGuid;
             if (!actual.Select(key).OrderBy(k => k, StringComparer.Ordinal).SequenceEqual(source.slots.Select(key).OrderBy(k => k, StringComparer.Ordinal))) throw new InvalidOperationException("Build scene body ownership changed");
             var transforms = roots.SelectMany(r => r.GetComponentsInChildren<Transform>(true)).ToDictionary(BodyMeshReferenceAudit.Route, StringComparer.Ordinal);
@@ -225,19 +297,17 @@ namespace TCG.SwitchStreaming.Editor
                 if (transforms[group.Key].GetComponent<MeshBundleOwner>()) throw new InvalidOperationException("Body scene was already converted");
             foreach (var group in source.slots.GroupBy(s => s.ownerPath))
                 if (CharacterMeshBuild.RewriteHierarchy(transforms[group.Key].gameObject, records) != group.Count()) throw new InvalidOperationException("Scene body conversion accounting changed");
-            if (Hash(source.path) != source.sha256) throw new InvalidOperationException("Body conversion wrote source scene");
         }
         public static void ProcessScene(Scene scene, BuildReport report)
         {
             if (scene.path != ScenePath || Path.GetFileName(Project) != "macos-port-work" || Path.GetFileName(Root) != "switch-on-demand") return;
             Guard();
-            if (report == null || report.summary.platform != BuildTarget.StandaloneWindows || !File.Exists(JournalPath)) throw new InvalidOperationException("Body scene requires verified Win32 preparation");
+            if (report == null || report.summary.platform != BuildTarget.StandaloneWindows || !File.Exists(JournalPath) || String.IsNullOrEmpty(buildToken)) throw new InvalidOperationException("Body scene requires verified Win32 preparation and current build token");
             var journal = Read(); ValidateFiles(Backups, journal.files);
             if (journal.phase != "prepared" || journal.files.Any(f => String.IsNullOrEmpty(f.preparedSha256) || Hash(f.path) != f.preparedSha256)) throw new InvalidOperationException("Body preparation incomplete");
             VerifyPrevious(journal, Path.GetDirectoryName(Local));
             var source = journal.audit.sources.Single(s => s.path == ScenePath);
             RewriteScene(scene, source, Reload(journal.records));
-            File.WriteAllText(Path.Combine(Root, "body-scene-build-proof.json"), JsonUtility.ToJson(source, true));
             Debug.Log("[BODY-BUILD] Converted224 scene slots on56 owners without saving source scene");
         }
     }

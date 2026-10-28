@@ -58,6 +58,7 @@ namespace TCG.SwitchStreaming.Editor
                     throw new InvalidOperationException("Run only in the prepared private switch-on-demand clone");
                 if (EditorUserBuildSettings.activeBuildTarget != BuildTarget.StandaloneWindows || !BuildPipeline.IsBuildTargetSupported(BuildTargetGroup.Standalone, BuildTarget.StandaloneWindows))
                     throw new InvalidOperationException("Start Unity with -buildTarget Win and the x86 Windows module installed");
+                BodyMeshBuild.Restore();
                 CharacterMeshBuild.Restore();
                 SurfaceBuild.Restore();
                 // Recover only our previous serialized-asset edits on a retry.
@@ -129,6 +130,7 @@ namespace TCG.SwitchStreaming.Editor
                 if (remaining.Count != 0) throw new InvalidOperationException("Unexplained eager artwork references remain: " + String.Join("; ", remaining.ToArray()));
                 CharacterMeshBuild.Prepare();
                 SurfaceBuild.Prepare();
+                BodyMeshBuild.Prepare();
                 PlayerSettings.SetScriptingBackend(NamedBuildTarget.Standalone, ScriptingImplementation.Mono2x);
                 PlayerSettings.SetManagedStrippingLevel(NamedBuildTarget.Standalone, ManagedStrippingLevel.Disabled);
                 PlayerSettings.SetUseDefaultGraphicsAPIs(BuildTarget.StandaloneWindows, false);
@@ -140,10 +142,12 @@ namespace TCG.SwitchStreaming.Editor
                 if (Directory.Exists(Path.Combine(Application.streamingAssetsPath, "TCGAutorunBundles"))) throw new InvalidOperationException("Obsolete all-content bootstrap bundles remain");
                 Directory.CreateDirectory(Path.GetDirectoryName(report.player));
                 Debug.Log("[STREAMING-BUILD] Building direct-scene player");
+                BodyMeshBuild.BeginPlayerBuild();
                 var built = BuildPipeline.BuildPlayer(new BuildPlayerOptions { scenes = Scenes, locationPathName = report.player,
                     target = BuildTarget.StandaloneWindows, targetGroup = BuildTargetGroup.Standalone, options = BuildOptions.None });
                 report.errors = (int)built.summary.totalErrors; report.warnings = (int)built.summary.totalWarnings;
                 if (built.summary.result != BuildResult.Succeeded || report.errors != 0) throw new InvalidOperationException("Direct-scene player build failed");
+                BodyMeshBuild.CompletePlayerBuild();
                 foreach (string path in Directory.GetFiles(Path.GetDirectoryName(report.player), "*", SearchOption.AllDirectories))
                 {
                     long length = new FileInfo(path).Length; report.largestFile = Math.Max(report.largestFile, length);

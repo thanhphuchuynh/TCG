@@ -24,6 +24,23 @@ BUILD_METADATA = frozenset(('m_ObjectHideFlags', 'm_CorrespondingSourceObject',
                             'm_PrefabInstance', 'm_PrefabAsset'))
 RESOURCE_CATALOG = 'tcgstreaming/meshcatalog'
 GUID = re.compile(r'[0-9a-f]{32}')
+BODY_PATHS = frozenset('Assets/Mesh/' + gender + '_Combined_LOD' + str(lod) + '.asset'
+                       for gender in ('Male', 'Female') for lod in range(4))
+
+
+def combine_reports(choice, body=None):
+    if body is None:
+        if any(row.get('path') in BODY_PATHS for row in choice.get('eligible', [])):
+            raise ValueError('Body entries require their native preparation/build proof')
+        return choice
+    if choice.get('status') != 'prepared' or choice.get('bundleCount') != 252 or len(choice.get('eligible', [])) != 252:
+        raise ValueError('Body migration requires the complete252 choice catalogue')
+    if body.get('status') != 'prepared' or body.get('bundleCount') != 8 or len(body.get('eligible', [])) != 8 or {r.get('path') for r in body['eligible']} != BODY_PATHS:
+        raise ValueError('Body migration requires exactly the original eight body paths')
+    if body.get('sourceSceneUnchanged') is not True or body.get('previousBundlesUnchanged') is not True or any(
+            body.get(field) != value for field, value in [('sceneBindingCount', 224), ('sceneOwnerCount', 56), ('prefabCount', 6), ('previousBundleCount', 252)]):
+        raise ValueError('Native body scene/bundle fidelity proof incomplete')
+    return dict(choice, eligible=choice['eligible'] + body['eligible'], bundleCount=260)
 
 
 def _hash_value(hasher, value):
@@ -400,8 +417,8 @@ def inspect_bundle(path, entry, record):
     return result
 
 
-def validate(baseline, player, build_report):
-    report = json.loads(build_report.read_text())
+def validate(baseline, player, build_report, body_report=None):
+    report = combine_reports(json.loads(build_report.read_text()), json.loads(body_report.read_text()) if body_report else None)
     mesh_root = player / 'StreamingAssets/TCGStreamedMeshes'
     manifest_text = (mesh_root / 'catalog.json').read_text()
     manifest = json.loads(manifest_text)
@@ -462,9 +479,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('baseline', 'player', 'report', 'output'):
         parser.add_argument('--' + name, type=pathlib.Path, required=True)
+    parser.add_argument('--body-report', type=pathlib.Path)
     args = parser.parse_args()
     try:
-        result = validate(args.baseline.resolve(), args.player.resolve(), args.report.resolve())
+        result = validate(args.baseline.resolve(), args.player.resolve(), args.report.resolve(), args.body_report.resolve() if args.body_report else None)
     except Exception as error:
         result = {'status': 'failed', 'errors': [type(error).__name__ + ': ' + str(error)]}
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -46,8 +46,22 @@ public static class MeshRuntimeTests
         string localRoot = Path.Combine(Application.streamingAssetsPath, "TCGStreamedMeshes");
         if (Directory.Exists(localRoot)) Directory.Delete(localRoot, true);
         AssetDatabase.Refresh();
+        var bodyRecords = TCG.SwitchStreaming.Editor.BodyMeshBuild.CollectBodies(new[] { folder + "/rigged.asset" });
+        var outer = new GameObject("outer actor container"); outer.SetActive(false);
+        var middle = new GameObject("middle"); middle.transform.SetParent(outer.transform, false);
+        var actor = new GameObject("original customizer"); actor.transform.SetParent(middle.transform, false);
+        var customizer = actor.AddComponent<CC.CharacterCustomization>();
+        var skin = actor.AddComponent<SkinnedMeshRenderer>(); skin.sharedMesh = bodyRecords[0].mesh;
+        skin.bones = new[] { actor.transform }; skin.rootBone = actor.transform; skin.SetBlendShapeWeight(0, 23);
+        skin.localBounds = new Bounds(Vector3.one, new Vector3(3, 4, 5)); customizer.MainMesh = skin;
+        string bodyPath = folder + "/NestedBody.prefab";
+        PrefabUtility.SaveAsPrefabAsset(outer, bodyPath); UnityEngine.Object.DestroyImmediate(outer);
+        var source = new TCG.SwitchStreaming.Editor.BodySource { path = bodyPath, guid = AssetDatabase.AssetPathToGUID(bodyPath), sha256 = TCG.SwitchStreaming.Editor.BodyMeshBuild.Hash(bodyPath),
+            slots = TCG.SwitchStreaming.Editor.BodyMeshReferenceAudit.Inspect(new[] { AssetDatabase.LoadAssetAtPath<GameObject>(bodyPath) }, bodyRecords, 1) };
+        TCG.SwitchStreaming.Editor.BodyMeshBuild.RewritePrefab(source, bodyRecords);
         EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
         var probe = new GameObject("Synthetic mesh runtime tests").AddComponent<MeshRuntimeProbe>();
+        probe.NestedBodyPrefab = AssetDatabase.LoadAssetAtPath<GameObject>(bodyPath); probe.NestedBodyKey = bodyRecords[0].key;
         probe.BundleRoot = root; probe.Crc = crc; probe.SecondCrc = secondCrc; probe.BadPayloadCrc = badCrc;
         EditorSceneManager.SaveScene(UnityEngine.SceneManagement.SceneManager.GetActiveScene(), folder + "/Tests.unity");
         EditorApplication.isPlaying = true;

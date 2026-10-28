@@ -10,6 +10,8 @@ using TCG.SwitchStreaming.Editor;
 public static class BodyMeshBuildTests
 {
     const string Folder = "Assets/BodyFixtures", ScenePath = Folder + "/Start.unity", Prefab = Folder + "/Actor.prefab";
+    [Serializable] sealed class ReceiptFixture { public int version; public string source, backup, preparedSha256, baselineSha256, sha256; }
+    static string FixtureHash(string path) { using (var sha = System.Security.Cryptography.SHA256.Create()) return BitConverter.ToString(sha.ComputeHash(File.ReadAllBytes(path))).Replace("-", "").ToLowerInvariant(); }
     static void Check(bool value, string message) { if (!value) throw new Exception(message); }
     static void Refuses(Action action) { bool refused = false; try { action(); } catch (InvalidOperationException) { refused = true; } Check(refused, "Unexpected body preparation accepted"); }
     static GameObject Actor(Mesh a, Mesh b)
@@ -49,6 +51,19 @@ public static class BodyMeshBuildTests
     {
         try
         {
+            string layout = Path.GetFullPath("body-source-guard/" + Guid.NewGuid().ToString("N") + "/switch-on-demand/macos-port-work");
+            string sourceFile = Path.Combine(layout, "Assets/Scripts/Assembly-CSharp/CC/CharacterCustomization.cs"), backupFile = Path.Combine(Path.GetDirectoryName(layout), "character-mesh-source-backup/CharacterCustomization.cs");
+            Directory.CreateDirectory(Path.GetDirectoryName(sourceFile)); Directory.CreateDirectory(Path.GetDirectoryName(backupFile));
+            File.WriteAllText(sourceFile, "prepared"); File.WriteAllText(backupFile, "original");
+            var receipt = new ReceiptFixture { version = 2, source = sourceFile, backup = backupFile,
+                preparedSha256 = FixtureHash(sourceFile), baselineSha256 = FixtureHash(backupFile), sha256 = FixtureHash(sourceFile) };
+            string receiptPath = Path.Combine(layout, "character-mesh-preparation.json");
+            File.WriteAllText(receiptPath, JsonUtility.ToJson(receipt)); BodyMeshBuild.ValidateCharacterReceipt(layout);
+            receipt.version = 1; File.WriteAllText(receiptPath, JsonUtility.ToJson(receipt)); Refuses(() => BodyMeshBuild.ValidateCharacterReceipt(layout));
+            receipt.version = 2; File.WriteAllText(receiptPath, JsonUtility.ToJson(receipt));
+            File.AppendAllText(sourceFile, "edit"); Refuses(() => BodyMeshBuild.ValidateCharacterReceipt(layout)); File.WriteAllText(sourceFile, "prepared");
+            File.AppendAllText(backupFile, "edit"); Refuses(() => BodyMeshBuild.ValidateCharacterReceipt(layout)); File.WriteAllText(backupFile, "original");
+            receipt.backup = "/tmp/foreign.cs"; File.WriteAllText(receiptPath, JsonUtility.ToJson(receipt)); Refuses(() => BodyMeshBuild.ValidateCharacterReceipt(layout));
             EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
             AssetDatabase.DeleteAsset(Folder); Directory.CreateDirectory(Folder); AssetDatabase.Refresh();
             foreach (string name in new[] { "a", "b" })
@@ -114,9 +129,13 @@ public static class BodyMeshBuildTests
             EditorSceneManager.SaveScene(root.scene, ScenePath);
             var payloadAudit = BodyMeshReferenceAudit.Scan(records, new[] { Prefab }, ScenePath, 2, new[] { Prefab, ScenePath });
             payloadSource = payloadAudit.sources.Single(s => s.path == ScenePath); payloadRecords = records;
-            BuildPayload("body-baseline"); convertPayload = true;
+            BuildPayload("body-baseline");
+            BodyMeshBuild.BeginPlayerBuild(); Refuses(() => BodyMeshBuild.VerifyPlayerBuild(ScenePath, 2, 1));
+            convertPayload = true;
             try { BuildPayload("body-converted"); } finally { convertPayload = false; }
             Check(callbacks == 1 && BodyMeshBuild.Hash(ScenePath) == payloadSource.sha256, "Build callback/source fidelity proof missing");
+            BodyMeshBuild.VerifyPlayerBuild(ScenePath, 2, 1);
+            BodyMeshBuild.BeginPlayerBuild(); Refuses(() => BodyMeshBuild.VerifyPlayerBuild(ScenePath, 2, 1));
             Debug.Log("BODY_BUILD_PASS audit, unknown consumer/owner refusal, scene-only conversion, rig/LOD/weights, batch recovery");
             File.WriteAllText("body-build-result.txt", "PASS body build native tests\n"); EditorApplication.Exit(0);
         }
