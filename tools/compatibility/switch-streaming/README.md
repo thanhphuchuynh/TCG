@@ -9,7 +9,8 @@ playable Switch port.
 private recovered project. It computes every replacement before writing sources
 and is safe to repeat. Also run `prepare_character_meshes.py PROJECT` for the two
 guarded character-part Instantiate hooks. Copy Runtime and Editor sources into
-the project; both preparation receipts are required by the combined build.
+the project. Also run `prepare_surfaces.py PROJECT` for the 24 original shop
+finish setters. All three preparation receipts are required by the combined build.
 
 The Unity batch entry point `TCG.SwitchStreaming.Editor.StreamingBuild.Run` is
 restricted to the prepared `switch-on-demand/macos-port-work` clone. Start Unity
@@ -85,3 +86,22 @@ Additional actual Unity entry points are `MeshRuntimeTests.Run`,
 and `CharacterRestoreTests.Run`; use separate fixture
 projects so their generated assets never enter the game. Preservation tests need
 UnityPy and the synthetic mesh fixture (`TCG_MESH_FIXTURES` points at its project).
+
+Finish textures use `SurfaceTextures.SetTexture` and a 64 MiB soft cache. The
+original data getter runs first; the hook maps its actual returned list index,
+preserving the game's high-index clamp. Non-null resident/runtime mod overrides
+remain intact. Material slots share pins; disabled managers retain them because
+world renderers live elsewhere. Destroyed owners or materials release cache pins,
+and borrowed material/fallback properties survive teardown.
+
+Only exclusive floor/wall/ceiling catalogue texture fields are stripped. Existing
+material defaults and all unknown references stay resident. The catalogue and
+source preparation use versioned original/prepared hashes and GUIDs; ambiguous
+or edited backups/receipts are rejected. No automatic legacy receipt adoption.
+
+`validate_surfaces.py --baseline DATA --player DATA --report REPORT --output JSON`
+compares against the previous character-streaming player, including complete
+Texture2D fields/pixels, retained textures, mesh payloads, quality and Resources.
+Run the artwork/mesh validators as well. Native Unity's chunked LZ4 output can
+contain raw fallback blocks for incompressible data; those preserve the same CRC
+and raw texture bytes. Full uncompressed/LZMA payloads remain unsupported.
