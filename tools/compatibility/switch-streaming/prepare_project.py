@@ -110,12 +110,24 @@ def refresh_callback(source, signature):
         original = "m_CenterFrameImage.sprite = m_MonsterData.GetIcon(m_CardData.expansionType);"
         if body.count(original) != 1:
             raise ValueError("Unknown web completion refresh")
-        return body.replace(original, "SetCardUI(m_CardData);")
+        return body.replace(original, "TCG.SwitchStreaming.CardArtSession.RefreshPreservingPresentation(this, () => SetCardUI(m_CardData));")
     return edit_method(source, signature, "FULL_STREAM_REFRESH", apply)
 
 
+def patch_presentation_setters(source):
+    for name, parameter, value, channel in [
+        ("SetFoilMaterialList", "List<Material> mat", "mat", "foil"),
+        ("SetFoilBlendedMaterialList", "List<Material> mat", "mat", "foil-blended"),
+        ("SetFoilMaterialListFromSettingData", "bool isWorldView", "isWorldView", "foil"),
+        ("SetFoilBlendedMaterialListFromSettingData", "bool isWorldView", "isWorldView", "foil-blended")]:
+        source = append(source, "public void " + name + "(" + parameter + ")",
+            '\t\tTCG.SwitchStreaming.CardArtSession.RememberPresentation(this, "' + channel + '", () => ' + name + '(' + value + '));', "PRESENTATION_" + name)
+    return source
+
+
 def patch_card_ui(source):
-    scope = "TCG.SwitchStreaming.CardArtSession.Begin(this, () => SetCardUI(m_CardData), m_Card3dUIGroup == null || m_Card3dUIGroup.m_IgnoreCulling)"
+    source = patch_presentation_setters(source)
+    scope = "TCG.SwitchStreaming.CardArtSession.Begin(this, () => TCG.SwitchStreaming.CardArtSession.RefreshPreservingPresentation(this, () => SetCardUI(m_CardData)), m_Card3dUIGroup == null || m_Card3dUIGroup.m_IgnoreCulling || !Card3dUISpawner.TCG_IsManagedPoolCard(m_Card3dUIGroup))"
     source = wrap_method(source, "public void SetCardUI(CardData cardData)", scope, "CARD_SCOPE")
     source = refresh_callback(source, "private void LoadStreamTextureCompleted(CEventPlayer_LoadStreamTextureCompleted evt)")
     source = append(source, "private void OnDisable()", "\t\tTCG.SwitchStreaming.CardArtSession.Disable(this);", "DISABLE")
@@ -149,6 +161,24 @@ def patch_inventory(source):
     return edit_method(source, signature, "TETRAMON", apply)
 
 
+def patch_pool_membership(source):
+    if "// TCG_STREAMING_POOL_QUERY" in source:
+        return source
+    masked = mask_csharp(source)
+    matches = list(re.finditer(r"\bclass\s+Card3dUISpawner\b", masked))
+    if len(matches) != 1:
+        raise ValueError("Missing unique Card3dUISpawner class")
+    end = block_end(masked, masked.index("{", matches[0].end()))
+    member = """
+    // TCG_STREAMING_POOL_QUERY
+    public static bool TCG_IsManagedPoolCard(Card3dUIGroup card)
+    {
+        return m_Instance != null && m_Instance.m_Card3dUIList.Contains(card);
+    }
+"""
+    return source[:end] + member + source[end:]
+
+
 def patch_spawner(source):
     def apply(body):
         owner = "m_Card3dUIList[m_CullIndex].m_CardUI"
@@ -161,22 +191,28 @@ def patch_spawner(source):
         if len(magnitude) != 1:
             raise ValueError("Unknown original culling distance")
         at = magnitude[0].end()
-        body = body[:at] + "\n\t\t\t\tif (magnitude < 10f) TCG.SwitchStreaming.CardArtSession.Prefetch(" + owner + ");" + body[at:]
+        allocated = "m_Card3dUIList[m_CullIndex].IsActive() && m_Card3dUIList[m_CullIndex].gameObject.activeInHierarchy"
+        body = body[:at] + "\n\t\t\t\tif (magnitude < 10f) TCG.SwitchStreaming.CardArtSession.Prefetch(" + owner + ", " + allocated + ");" + body[at:]
         anchor = "\n\t\t\tm_CullIndex++;"
         if body.count(anchor) != 1:
             raise ValueError("Unknown cull loop")
         return body.replace(anchor, "\n\t\t\telse if ((bool)m_Card3dUIList[m_CullIndex] && m_Card3dUIList[m_CullIndex].m_IgnoreCulling)\n\t\t\t{\n\t\t\t\tTCG.SwitchStreaming.CardArtSession.SetVisible(" + owner + ", true);\n\t\t\t}" + anchor)
-    return edit_method(source, "private void Update()", "WORLD_VISIBILITY", apply)
+    return patch_pool_membership(edit_method(source, "private void Update()", "WORLD_VISIBILITY", apply))
 
 
 def patch_opening(source):
-    source = append(source, "public void OpenScreen(ECollectionPackType collectionPackType, bool isMultiPack, bool isPremiumPack = false)",
-        "\t\tfor (int tcg = 0; tcg < m_ManualOpenCardDataList.Count; tcg++)\n\t\t\tTCG.SwitchStreaming.CardArtSession.Prime(m_Card3dUIList[tcg].m_CardUI);", "PACK_PRIME")
+    def prime_before_branch(body):
+        anchor = "CSingleton<InteractionPlayerController>.Instance.m_CollectionBinderFlipAnimCtrl.SetCanUpdateSort(canSort: true);"
+        if mask_csharp(body).count(anchor) != 1:
+            raise ValueError("Unknown common pack binding exit")
+        code = "\n\t\tfor (int tcg = 0; tcg < m_ManualOpenCardDataList.Count; tcg++)\n\t\t\tTCG.SwitchStreaming.CardArtSession.Prime(m_Card3dUIList[tcg].m_CardUI);"
+        return body.replace(anchor, anchor + code)
+    source = edit_method(source, "public void OpenScreen(ECollectionPackType collectionPackType, bool isMultiPack, bool isPremiumPack = false)", "PACK_PRIME", prime_before_branch)
     return prepend(source, "private void Update()", """\t\tif (!m_IsScreenActive)
 \t\t{
 \t\t\tforeach (var tcgView in m_Card3dUIList) TCG.SwitchStreaming.CardArtSession.CancelPrime(tcgView.m_CardUI);
 \t\t}
-\t\telse if (m_StateIndex >= 1 && m_StateIndex <= 3)
+\t\telse if ((m_StateIndex >= 1 && m_StateIndex <= 3) || m_StateIndex == 101)
 \t\t{
 \t\t\tfor (int tcg = 0; tcg < m_ManualOpenCardDataList.Count; tcg++)
 \t\t\t\tif (!TCG.SwitchStreaming.CardArtSession.Ready(m_Card3dUIList[tcg].m_CardUI)) return;
@@ -199,6 +235,15 @@ def patch_deck(source):
     return page_gate(source, "private void EvaluateCardPanelUI()", "m_DeckCardEditPanelUIList", "item.m_CardUI")
 
 
+def upgrade_baseline(current, saved, expected_hash):
+    if not saved.is_file() or not expected_hash:
+        return current
+    baseline = saved.read_text()
+    if hashlib.sha256(current.encode()).hexdigest() != expected_hash and current != baseline:
+        raise ValueError("Prepared source has unrecorded edits: " + str(saved.name))
+    return baseline
+
+
 def prepare_project(project, tools):
     project, tools = pathlib.Path(project).resolve(), pathlib.Path(tools).resolve()
     scripts = project / "Assets/Scripts/Assembly-CSharp"
@@ -207,17 +252,21 @@ def prepare_project(project, tools):
                   "BinderPageGrp.cs": patch_binder, "DeckEditScreen.cs": patch_deck}
     if not scripts.is_dir():
         raise ValueError("Not the private recovered game project")
+    backup = project.parent / "streaming-source-backup"
+    previous = project / "streaming-preparation.json"
+    recorded = {entry["path"]: entry["sha256"] for entry in json.loads(previous.read_text())["files"]} if previous.is_file() else {}
     replacements = {}
     for name, transform in transforms.items():
         path = scripts / name
         if not path.is_file():
             raise ValueError("Missing integration source: " + name)
         original = path.read_text()
-        replacements[path] = (original, transform(original))
+        relative = path.relative_to(project)
+        baseline = upgrade_baseline(original, backup / relative, recorded.get(str(relative)))
+        replacements[path] = (original, transform(baseline))
     for folder in ["Runtime", "Editor"]:
         if not (tools / folder).is_dir():
             raise ValueError("Missing own source folder: " + folder)
-    backup = project.parent / "streaming-source-backup"
     receipt = {"files": []}
     for path, (original, patched) in replacements.items():
         relative = path.relative_to(project)

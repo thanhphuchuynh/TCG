@@ -27,6 +27,7 @@ namespace TCG.SwitchStreaming
             public Frame Frame;
             public readonly Dictionary<string, ArtCache<LoadedArtBundle>.Lease> Warm = new Dictionary<string, ArtCache<LoadedArtBundle>.Lease>();
             public readonly Dictionary<string, ArtCache<LoadedArtBundle>.Lease> Primed = new Dictionary<string, ArtCache<LoadedArtBundle>.Lease>();
+            public readonly Dictionary<string, Action> Presentation = new Dictionary<string, Action>(StringComparer.Ordinal);
         }
         sealed class Frame
         {
@@ -192,7 +193,11 @@ namespace TCG.SwitchStreaming
             State state; if (!owners.TryGetValue(id, out state) || !state.Owner || !state.Owner.gameObject.activeInHierarchy) return;
             UnityArtService.Instance.Trace("reactivate " + id + " keys=" + (state.Frame == null ? -1 : state.Frame.Keys.Count));
             state.Active = true;
-            if (state.Visible && state.Frame != null && state.Frame.Keys.Count > 0) state.Queued = true;
+            if (state.Frame != null)
+            {
+                if (state.Frame.Keys.Count == 0) Show(state);
+                else if (state.Visible) state.Queued = true;
+            }
         }
         public static void SetVisible(Component owner, bool visible)
         {
@@ -202,8 +207,10 @@ namespace TCG.SwitchStreaming
             if (visible) Reactivate(owner); else Disable(owner);
         }
         public static void Prefetch(Component owner)
+        { Prefetch(owner, owner && owner.gameObject.activeInHierarchy); }
+        public static void Prefetch(Component owner, bool allocated)
         {
-            if (!owner || !UnityArtService.Available) return; State state;
+            if (!allocated || !owner || !UnityArtService.Available) return; State state;
             if (!owners.TryGetValue(owner.GetInstanceID(), out state) || state.Frame == null) return;
             var service = UnityArtService.Instance;
             foreach (string key in state.Frame.Keys)
@@ -254,6 +261,21 @@ namespace TCG.SwitchStreaming
         {
             if (!owner || !UnityArtService.Available) return true; State state;
             return !owners.TryGetValue(owner.GetInstanceID(), out state) || !state.Hidden;
+        }
+        public static void RememberPresentation(Component owner, string channel, Action apply)
+        {
+            if (!owner || apply == null) return; State state;
+            if (owners.TryGetValue(owner.GetInstanceID(), out state)) state.Presentation[channel] = apply;
+        }
+        public static void RefreshPreservingPresentation(Component owner, Action refresh)
+        {
+            State state;
+            if (!owner || !owners.TryGetValue(owner.GetInstanceID(), out state)) { refresh(); return; }
+            // Material setters within SetCardUI establish defaults. Replay the
+            // caller's last choice using the current settings after rebinding.
+            var restore = new List<Action>(state.Presentation.Values);
+            try { refresh(); }
+            finally { foreach (var apply in restore) if (owner) apply(); }
         }
         internal static void Forget(int id)
         {

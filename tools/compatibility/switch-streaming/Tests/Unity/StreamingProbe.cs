@@ -9,11 +9,18 @@ public sealed class StreamingTestView : MonoBehaviour
 {
     public Image Target;
     public int Monster, Refreshes;
+    public Material DefaultFoil;
+    public void SetFoil(Material material)
+    {
+        Target.material = material;
+        CardArtSession.RememberPresentation(this, "foil", () => SetFoil(material));
+    }
     public void Render(int monster)
     {
         Monster = monster; Refreshes++;
-        using (CardArtSession.Begin(this, () => Render(Monster)))
+        using (CardArtSession.Begin(this, () => CardArtSession.RefreshPreservingPresentation(this, () => Render(Monster))))
         {
+            if (DefaultFoil) SetFoil(DefaultFoil);
             Sprite sprite;
             if (!CardArtSession.TryResolve(monster, "icon", 0, out sprite)) throw new Exception("Missing synthetic manifest key");
             Target.sprite = sprite;
@@ -68,7 +75,32 @@ public sealed class StreamingProbe : MonoBehaviour
         var resident = View("resident card without relocated artwork");
         using (CardArtSession.Begin(resident, () => { }, false)) { resident.Target.sprite = LoadingSprite; }
         Check(resident.GetComponent<CanvasGroup>().alpha == 1 && service.Cache.PendingCount == 0, "Resident artwork was hidden by an empty streaming session");
+        resident.gameObject.SetActive(false); resident.gameObject.SetActive(true);
+        Check(resident.GetComponent<CanvasGroup>().alpha == 1 && resident.GetComponent<CanvasGroup>().interactable && resident.GetComponent<CanvasGroup>().blocksRaycasts, "Resident-only card stayed hidden after reactivation");
+        CardArtSession.SetVisible(resident, false); CardArtSession.SetVisible(resident, true);
+        Check(resident.GetComponent<CanvasGroup>().alpha == 1 && service.Cache.PendingCount == 0, "Resident-only cull/uncull lost authored visibility");
         Destroy(resident.gameObject); passed++;
+        var foil = View("world foil override");
+        var tangent = new Material(foil.Target.defaultMaterial); var world = new Material(foil.Target.defaultMaterial);
+        foil.DefaultFoil = tangent; foil.Render(1); foil.SetFoil(world);
+        float foilDeadline = Time.realtimeSinceStartup + 20;
+        while (!ColorIs(foil.Target.sprite, Color.red) && Time.realtimeSinceStartup < foilDeadline) yield return null;
+        Check(ColorIs(foil.Target.sprite, Color.red) && foil.Target.material == world, "Async binding overwrote the caller's world foil material");
+        foil.gameObject.SetActive(false); foil.gameObject.SetActive(true); foilDeadline = Time.realtimeSinceStartup + 20;
+        while (!ColorIs(foil.Target.sprite, Color.red) && Time.realtimeSinceStartup < foilDeadline) yield return null;
+        Check(ColorIs(foil.Target.sprite, Color.red) && foil.Target.material == world, "Reactivation overwrote the caller's foil material");
+        foil.gameObject.SetActive(false); Destroy(foil.gameObject); Destroy(tangent); Destroy(world); yield return null; passed++;
+        var pooled = View("inactive returned pool entry"); pooled.Render(1); pooled.gameObject.SetActive(false);
+        float poolDeadline = Time.realtimeSinceStartup + 20;
+        while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < poolDeadline) yield return null;
+        service.Cache.TrimAllUnpinned();
+        for (int pass = 0; pass < 20; pass++) CardArtSession.Prefetch(pooled, false);
+        Check(service.Cache.PendingCount == 0 && service.Cache.LoadedBytes == 0, "Discarded pooled card reloaded obsolete artwork");
+        CardArtSession.Prefetch(pooled, true); // Allocated parent, culled artwork child.
+        Check(service.Cache.PendingCount > 0, "Allocated card with a hidden artwork child lost prefetch");
+        poolDeadline = Time.realtimeSinceStartup + 20;
+        while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < poolDeadline) yield return null;
+        service.Cache.TrimAllUnpinned(); Destroy(pooled.gameObject); yield return null; passed++;
         var pack = View("pack prepared while hidden"); pack.gameObject.SetActive(false); pack.Render(1);
         CardArtSession.Prime(pack);
         float packDeadline = Time.realtimeSinceStartup + 20;
