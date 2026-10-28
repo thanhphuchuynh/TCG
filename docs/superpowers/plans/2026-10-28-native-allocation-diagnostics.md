@@ -38,3 +38,15 @@ buffers, not the unexplained bulk. Anonymous requests1495.6 MiB atfailure.
 Refine observation using existing tested native_heap statistics, including largest
 aligned/newlib holes and shared gap, before changing allocator semantics. These
 hole figures are snapshots, not guarantees that a particular alignment fits.
+
+Refined replay: after one separately preserved startup wait stall, unchanged
+repeat reached title then39% load/38% Player and ENOMEM. Post-failure aligned
+heap used2991.5 MiB, free91.125 MiB/largest16.125 MiB; newlibfree18.601 MiB/
+largest2.744 MiB, gap0.688 MiB. These snapshots support fragmentation/pressure,
+but are not an instantaneous failing-allocation trace. No allocator change yet.
+Next separate physical-heap source-page attributes using bounded svcQueryMemory
+scan. DeviceMapped/Borrowed/IPC fields overlap; exclude virtual aliases outside
+physical heap and non-Heap types, mark partial queries explicitly. This measures
+registered source pages rather than live texture bytes or a complete RAM total.
+The device scan's complete flag means traversal reached the heap end; concurrent
+mapping changes mean this is not an atomic snapshot of all attributes.

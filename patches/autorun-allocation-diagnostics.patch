@@ -122,15 +122,16 @@ diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
 diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
 --- a/horizon-wine/source/runtime.c
 +++ b/horizon-wine/source/runtime.c
-@@ -25,6 +25,7 @@
+@@ -25,6 +25,8 @@
  #include "horizon_runtime_paths.h"
  #include "launcher.h"
  #include "low_window.h"
 +#include "native_heap.h"
++#include "heap_devices.h"
  #include "autorun_install.h"
  #include "forwarder.h"
  #include "forwarder_launch.h"
-@@ -1366,9 +1367,29 @@
+@@ -1366,9 +1368,37 @@
          {
              extern void wine_nx_thread_report( void );
              extern void horizon_memory_pool_stats( char *buffer, size_t size );
@@ -157,6 +158,14 @@ diff --git a/horizon-wine/source/runtime.c b/horizon-wine/source/runtime.c
 +                          "small_free_bytes=%zu small_largest_bytes=%zu gap_bytes=%zu holes=%zu/%zu complete=%d",
 +                          stats.used, stats.free, stats.largest, stats.small_free, stats.small_largest,
 +                          stats.gap, stats.holes, stats.small_holes, stats.complete );
++            }
++            {
++                struct wine_nx_heap_devices stats;
++                wine_nx_heap_devices_snapshot( (uintptr_t)fake_heap_start, (uintptr_t)fake_heap_end, &stats );
++                log_line( "[HEAP-DEVICES] device_mapped_bytes=%llu borrowed_bytes=%llu ipc_bytes=%llu "
++                          "regions=%u complete=%u",
++                          (unsigned long long)stats.device_bytes, (unsigned long long)stats.borrowed_bytes,
++                          (unsigned long long)stats.ipc_bytes, stats.regions, stats.complete );
 +            }
              wine_nx_thread_report();
          }
@@ -420,7 +429,7 @@ diff --git a/horizon-wine/check-allocation-diagnostics.sh b/horizon-wine/check-a
 new file mode 100644
 --- /dev/null
 +++ b/horizon-wine/check-allocation-diagnostics.sh
-@@ -0,0 +1,12 @@
+@@ -0,0 +1,15 @@
 +#!/bin/sh
 +# Observer tests execute own Autorun host bridge, not FEX upstream code.
 +set -eu
@@ -433,3 +442,101 @@ new file mode 100644
 +    "$root/horizon-wine/tests/fex_horizon_jit.c" -o "$build/jit"
 +"$build/jit"
 +python3 "$root/horizon-wine/tests/check_allocation_diagnostics.py"
++"$cc" -Wall -Wextra -Werror -fsanitize=address,undefined \
++    "$root/horizon-wine/tests/heap_devices.c" -o "$build/devices"
++"$build/devices"
+diff --git a/horizon-wine/source/heap_devices.h b/horizon-wine/source/heap_devices.h
+new file mode 100644
+--- /dev/null
++++ b/horizon-wine/source/heap_devices.h
+@@ -0,0 +1,41 @@
++#ifndef WINE_NX_HEAP_DEVICES_H
++#define WINE_NX_HEAP_DEVICES_H
++#include <stdint.h>
++#include <string.h>
++
++/* Registered GPU/IPC/alias source pages in the physical libnx heap window.
++ * Flags overlap, so these counters are not additive or a GPU residency budget.
++ * Switch API declarations come from the includer's switch.h. */
++struct wine_nx_heap_devices
++{
++    uint64_t device_bytes, borrowed_bytes, ipc_bytes;
++    unsigned int regions, complete;
++};
++static inline void wine_nx_heap_devices_snapshot( uint64_t start, uint64_t end,
++                                                 struct wine_nx_heap_devices *out )
++{
++    uint64_t at = start;
++    memset( out, 0, sizeof(*out) );
++    if (end <= start) return;
++    while (at < end && out->regions < 16384)
++    {
++        MemoryInfo info = {0};
++        u32 page = 0;
++        uint64_t next, bytes;
++        if (R_FAILED(svcQueryMemory( &info, &page, at ))) return;
++        if (!info.size || info.size > UINT64_MAX - info.addr || info.addr > at) return;
++        next = info.addr + info.size;
++        if (next <= at) return;
++        bytes = (next < end ? next : end) - at;
++        if (info.type == MemType_Heap)
++        {
++            if (info.attr & MemAttr_IsDeviceMapped) out->device_bytes += bytes;
++            if (info.attr & MemAttr_IsBorrowed) out->borrowed_bytes += bytes;
++            if (info.attr & MemAttr_IsIpcMapped) out->ipc_bytes += bytes;
++        }
++        out->regions++;
++        at = next;
++    }
++    out->complete = at >= end;
++}
++#endif
+diff --git a/horizon-wine/tests/heap_devices.c b/horizon-wine/tests/heap_devices.c
+new file mode 100644
+--- /dev/null
++++ b/horizon-wine/tests/heap_devices.c
+@@ -0,0 +1,44 @@
++#include <assert.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <stdio.h>
++typedef uint64_t u64;
++typedef uint32_t u32;
++typedef uint32_t Result;
++enum {MemType_Heap=5, MemType_Code=3, MemAttr_IsDeviceMapped=4, MemAttr_IsBorrowed=1, MemAttr_IsIpcMapped=2};
++#define R_FAILED(x) ((x)!=0)
++typedef struct {u64 addr,size;u32 type,attr;} MemoryInfo;
++static MemoryInfo regions[] = {
++    {0,200,MemType_Heap,MemAttr_IsDeviceMapped},
++    {200,300,MemType_Heap,MemAttr_IsBorrowed|MemAttr_IsDeviceMapped},
++    {500,200,MemType_Code,MemAttr_IsDeviceMapped}, /* alias outside physical heap type */
++    {700,300,MemType_Heap,MemAttr_IsIpcMapped},
++};
++static unsigned int calls, fail_at;
++static Result svcQueryMemory(MemoryInfo *info,u32 *page,u64 addr)
++{
++    (void)page;
++    if (++calls==fail_at) return 1;
++    for(unsigned int i=0;i<sizeof(regions)/sizeof(regions[0]);++i)
++        if(addr>=regions[i].addr && addr<regions[i].addr+regions[i].size) {*info=regions[i];return 0;}
++    return 1;
++}
++#include "../source/heap_devices.h"
++int main(void)
++{
++    struct wine_nx_heap_devices out;
++    wine_nx_heap_devices_snapshot(100,900,&out);
++    assert(out.complete && out.regions==4 && calls==4);
++    assert(out.device_bytes==400 && out.borrowed_bytes==300 && out.ipc_bytes==200);
++    calls=0;fail_at=2;
++    wine_nx_heap_devices_snapshot(100,900,&out);
++    assert(!out.complete && out.device_bytes==100 && out.regions==1);
++    calls=fail_at=0;regions[1].size=0;
++    wine_nx_heap_devices_snapshot(100,900,&out);
++    assert(!out.complete && calls==2);
++    calls=0;
++    wine_nx_heap_devices_snapshot(900,100,&out);
++    assert(!out.complete && !calls);
++    puts("Heap device snapshot: physical heap clipping, alias exclusion, overlapping attributes, query failure and nonprogress guards passed");
++}
