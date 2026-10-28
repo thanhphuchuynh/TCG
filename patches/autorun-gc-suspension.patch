@@ -1,4 +1,4 @@
-From b7cced75bb53a10304a605718a1f8be968da4d3e Mon Sep 17 00:00:00 2001
+From fdc3ae811c03bfcf4a453e1fb8a4a8c02dfb388c Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
 Date: Wed, 28 Oct 2026 13:49:34 +0700
 Subject: [PATCH] ntdll: suspend WoW64 threads through the CPU backend on
@@ -19,13 +19,13 @@ futex, and the server waited forever for a context such a thread never sent.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- dlls/ntdll/unix/horizon.c         | 29 ++++++++++---
+ dlls/ntdll/unix/horizon.c         | 29 +++++++++--
  dlls/ntdll/unix/horizon_private.h |  2 +
- dlls/ntdll/unix/loader.c          | 24 +++++++++++
- dlls/ntdll/unix/signal_arm64.c    | 70 ++++++++++++++++++++++++++++++-
- dlls/ntdll/unix/thread.c          | 27 ++++++++++++
+ dlls/ntdll/unix/loader.c          | 24 ++++++++++
+ dlls/ntdll/unix/signal_arm64.c    | 80 +++++++++++++++++++++++++++++--
+ dlls/ntdll/unix/thread.c          | 27 +++++++++++
  dlls/ntdll/unix/unix_private.h    |  1 +
- 6 files changed, 146 insertions(+), 7 deletions(-)
+ 6 files changed, 155 insertions(+), 8 deletions(-)
 
 diff --git a/dlls/ntdll/unix/horizon.c b/dlls/ntdll/unix/horizon.c
 index 2d558c17..575d6feb 100644
@@ -135,7 +135,7 @@ index cd362f5a..fe17cc29 100644
   *           load_ntdll_functions
   */
 diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
-index db9a7a29..c8a58584 100644
+index db9a7a29..1f98618f 100644
 --- a/dlls/ntdll/unix/signal_arm64.c
 +++ b/dlls/ntdll/unix/signal_arm64.c
 @@ -135,13 +135,41 @@ static NTSTATUS check_current_thread_context_access( HANDLE handle, ACCESS_MASK
@@ -229,7 +229,24 @@ index db9a7a29..c8a58584 100644
  extern void wine_nx_call_pe_apc( PNTAPCFUNC func, ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3,
                                  CONTEXT *context, TEB *teb );
  __ASM_GLOBAL_FUNC( wine_nx_call_pe_apc,
-@@ -566,6 +628,7 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+@@ -187,6 +249,7 @@ NTSTATUS call_user_apc_dispatcher( CONTEXT *context, unsigned int flags, ULONG_P
+     CONTEXT here;
+ 
+     if (flags) FIXME( "flags %#x are not supported.\n", flags );
++    horizon_park_if_suspended();
+     if (!horizon_capture_context( &here ))
+         wine_nx_call_pe_apc( func, arg1, arg2, arg3, &here, NtCurrentTeb() );
+     if (context) return signal_set_full_context( context );
+@@ -338,6 +401,8 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
+     if (ret_ptr) *ret_ptr = NULL;
+     if (ret_len) *ret_len = 0;
+     if (!peb || !peb->KernelCallbackTable) return STATUS_NOT_IMPLEMENTED;
++    /* The callback runs PE code: a suspended thread must not get there. */
++    horizon_park_if_suspended();
+     wine_nx_set_active_pe_teb( teb );
+     table = peb->KernelCallbackTable;
+     if (!table[id]) return STATUS_NOT_IMPLEMENTED;
+@@ -566,6 +631,7 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
  
          if (&wine_nx_quit_requested && wine_nx_quit_requested && &wine_nx_quit_point) wine_nx_quit_point();
      }
@@ -237,7 +254,7 @@ index db9a7a29..c8a58584 100644
  #endif
      SYSTEM_SERVICE_TABLE *table = &KeServiceDescriptorTable[table_idx];
      ULONG_PTR *handler;
-@@ -646,6 +709,9 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
+@@ -646,6 +712,9 @@ ULONG_PTR wine_nx_do_syscall( ULONG_PTR *stack_args,
          wine_nx_runtime_trace( buf );
      }
  
@@ -247,6 +264,21 @@ index db9a7a29..c8a58584 100644
      return result;
  }
  
+@@ -771,8 +840,13 @@ typedef NTSTATUS (*unixlib_entry_t)( void *args );
+ NTSTATUS __wine_unix_call_dispatcher_impl( unixlib_handle_t handle, unsigned int index, void *args )
+ {
+     const unixlib_entry_t *table = (const unixlib_entry_t *)(ULONG_PTR)handle;
++    NTSTATUS status;
++
+     if (!table) return STATUS_INVALID_PARAMETER;
+-    return table[index]( args );
++    status = table[index]( args );
++    /* Like a system call's, a unix call's return leads back into the JIT. */
++    horizon_park_if_suspended();
++    return status;
+ }
+ 
+ __asm__(
 diff --git a/dlls/ntdll/unix/thread.c b/dlls/ntdll/unix/thread.c
 index e7685ed1..53816b4f 100644
 --- a/dlls/ntdll/unix/thread.c
