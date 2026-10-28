@@ -88,31 +88,41 @@ namespace TCG.SwitchStreaming.Editor
         }
         public static void RewritePrefab(string path, IList<MeshRecord> eligible)
         {
-            var byGuid = eligible.ToDictionary(record => record.guid, StringComparer.Ordinal);
             var root = PrefabUtility.LoadPrefabContents(path);
             try
             {
-                if (root.GetComponent<MeshBundleOwner>()) throw new InvalidOperationException("Restore original prefab before retry: " + path);
-                var bindings = new List<MeshBinding>();
-                foreach (var renderer in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
-                {
-                    MeshRecord record;
-                    if (!Find(renderer.sharedMesh, byGuid, out record)) continue;
-                    var weights = new float[renderer.sharedMesh.blendShapeCount];
-                    for (int i = 0; i < weights.Length; i++) weights[i] = renderer.GetBlendShapeWeight(i);
-                    bindings.Add(new MeshBinding { skinned = renderer, key = record.key, defaultWeights = weights, defaultBounds = renderer.localBounds });
-                    renderer.sharedMesh = null;
-                }
-                foreach (var filter in root.GetComponentsInChildren<MeshFilter>(true))
-                {
-                    MeshRecord record; if (!Find(filter.sharedMesh, byGuid, out record)) continue;
-                    bindings.Add(new MeshBinding { filter = filter, key = record.key, defaultWeights = new float[0] }); filter.sharedMesh = null;
-                }
-                if (bindings.Count == 0) return;
-                root.AddComponent<MeshBundleOwner>().Bindings = bindings.ToArray();
-                if (!PrefabUtility.SaveAsPrefabAsset(root, path)) throw new IOException("Cannot save mesh bindings: " + path);
+                if (RewriteHierarchy(root, eligible) != 0 && !PrefabUtility.SaveAsPrefabAsset(root, path))
+                    throw new IOException("Cannot save mesh bindings: " + path);
             }
             finally { PrefabUtility.UnloadPrefabContents(root); }
+        }
+        public static int RewriteHierarchy(GameObject root, IList<MeshRecord> eligible)
+        {
+            if (!root || root.GetComponent<MeshBundleOwner>()) throw new InvalidOperationException("Restore original hierarchy before retry");
+            var byGuid = eligible.ToDictionary(record => record.guid, StringComparer.Ordinal);
+            var bindings = new List<MeshBinding>();
+            foreach (var renderer in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                MeshRecord record;
+                if (!Find(renderer.sharedMesh, byGuid, out record)) continue;
+                var weights = new float[renderer.sharedMesh.blendShapeCount];
+                for (int i = 0; i < weights.Length; i++) weights[i] = renderer.GetBlendShapeWeight(i);
+                bindings.Add(new MeshBinding { skinned = renderer, key = record.key, defaultWeights = weights, defaultBounds = renderer.localBounds });
+            }
+            foreach (var filter in root.GetComponentsInChildren<MeshFilter>(true))
+            {
+                MeshRecord record; if (!Find(filter.sharedMesh, byGuid, out record)) continue;
+                bindings.Add(new MeshBinding { filter = filter, key = record.key, defaultWeights = new float[0] });
+            }
+            if (bindings.Count == 0) return 0;
+            // Capture every authored state before clearing any slot.
+            foreach (var binding in bindings)
+            {
+                if (binding.skinned) binding.skinned.sharedMesh = null;
+                else binding.filter.sharedMesh = null;
+            }
+            root.AddComponent<MeshBundleOwner>().Bindings = bindings.ToArray();
+            return bindings.Count;
         }
         static bool Find(Mesh mesh, Dictionary<string, MeshRecord> records, out MeshRecord record)
         {
@@ -182,7 +192,7 @@ namespace TCG.SwitchStreaming.Editor
                 throw new InvalidOperationException("Invalid journaled prefab path");
             return Path.GetFullPath(Path.Combine(root, path));
         }
-        static void ValidatePrefabSnapshots(string project, string backups, IList<PrefabSnapshot> snapshots)
+        public static void ValidatePrefabSnapshots(string project, string backups, IList<PrefabSnapshot> snapshots)
         {
             if (Path.GetFullPath(project) != Project || snapshots == null || snapshots.Count == 0) throw new InvalidOperationException("Expected current project and nonempty prefab identity journal");
             var paths = new HashSet<string>(StringComparer.Ordinal); var guids = new HashSet<string>(StringComparer.Ordinal);
