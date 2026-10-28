@@ -1,4 +1,4 @@
-From 2a36ecc92ef3316800de7b1b1072faf09642bcc2 Mon Sep 17 00:00:00 2001
+From 695f5f75601da6f008c307e8bc980affd61870a7 Mon Sep 17 00:00:00 2001
 From: tphuc <phuc.huynhthanh@avironactive.com>
 Date: Wed, 28 Oct 2026 13:49:34 +0700
 Subject: [PATCH] ntdll: suspend WoW64 threads through the CPU backend on
@@ -100,7 +100,7 @@ index f33f8c57..af440aff 100644
  extern void horizon_get_address_space_limits( void **start, void **limit );
  extern void *virtual_alloc_horizon_native( size_t size, void **token );
 diff --git a/dlls/ntdll/unix/loader.c b/dlls/ntdll/unix/loader.c
-index cd362f5a..74c50a23 100644
+index cd362f5a..fe17cc29 100644
 --- a/dlls/ntdll/unix/loader.c
 +++ b/dlls/ntdll/unix/loader.c
 @@ -1677,6 +1677,30 @@ static const void *get_module_data_dir( HMODULE module, ULONG dir, ULONG *size )
@@ -113,7 +113,7 @@ index cd362f5a..74c50a23 100644
 + * modules loaded at start-up, which stay put. */
 +void *horizon_find_module_export( const WCHAR *name, const char *export )
 +{
-+    PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->Ldr;
++    PEB_LDR_DATA *ldr = NtCurrentTeb()->Peb->LdrData;
 +    LIST_ENTRY *entry;
 +
 +    if (!ldr) return NULL;
