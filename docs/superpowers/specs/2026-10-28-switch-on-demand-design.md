@@ -1,6 +1,6 @@
 # Switch on-demand artwork loading
 
-Date: 2026-10-28. Status: proposed design, awaiting approval after builder review.
+Date: 2026-10-28. Status: approved by the user after builder review; implementation authorized.
 
 ## Intent and user decision
 
