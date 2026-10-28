@@ -85,12 +85,14 @@ public sealed class StreamingProbe : MonoBehaviour
         while (service.Cache.PendingCount > 0 && Time.realtimeSinceStartup < packDeadline) yield return null;
         service.Cache.TrimAllUnpinned(); Check(service.Cache.PinnedBytes == 0 && service.Cache.LoadedBytes == 0, "Cancelled pack retained artwork");
         Destroy(pack.gameObject); passed++;
-        var page = new GameObject("album page");
+        var page = new GameObject("album page"); page.SetActive(false);
         var pageA = View("page first card"); var pageB = View("page second card");
         pageA.transform.SetParent(page.transform, false); pageB.transform.SetParent(page.transform, false);
         pageA.Render(1); pageB.Render(3);
         ArtPageGate.Watch(page.transform, new Component[] { pageA, pageB });
-        Check(page.GetComponent<CanvasGroup>().alpha == 0, "Album exposed an incomplete page");
+        Check(page.GetComponent<CanvasGroup>().alpha == 0 && !page.GetComponent<CanvasGroup>().interactable && !page.GetComponent<CanvasGroup>().blocksRaycasts, "Album exposed invisible loading controls");
+        Check(service.Cache.PinnedBytes == 512 && service.Cache.PendingCount == 2, "Hidden upcoming album page was not preloaded");
+        page.gameObject.SetActive(true);
         float pageDeadline = Time.realtimeSinceStartup + 20;
         while (page.GetComponent<CanvasGroup>().alpha == 0 && Time.realtimeSinceStartup < pageDeadline) yield return null;
         Check(page.GetComponent<CanvasGroup>().alpha == 1 && ColorIs(pageA.Target.sprite, Color.red) && ColorIs(pageB.Target.sprite, Color.blue), "Album page appeared before all authored artwork was bound");
@@ -109,9 +111,11 @@ public sealed class StreamingProbe : MonoBehaviour
         var a = View("owner a"); var b = View("owner b");
         a.Render(1); b.Render(2);
         Check(service.Cache.PendingCount == 1 && service.Cache.PinnedBytes == 256, "Actual shared texture load was duplicated");
+        Check(!a.GetComponent<CanvasGroup>().interactable && !a.GetComponent<CanvasGroup>().blocksRaycasts, "Pending artwork retained invisible UI hit targets");
         float deadline = Time.realtimeSinceStartup + 20;
         while ((a.Target.sprite == LoadingSprite || b.Target.sprite == LoadingSprite) && Time.realtimeSinceStartup < deadline) yield return null;
         Check(a.Target.sprite != null && a.Target.sprite != LoadingSprite && a.Target.sprite == b.Target.sprite, "Actual shared authored sprite did not arrive");
+        Check(a.GetComponent<CanvasGroup>().interactable && a.GetComponent<CanvasGroup>().blocksRaycasts, "Complete artwork did not restore UI interaction flags");
         var red = a.Target.sprite; var texture = red.texture;
         Check(red.rect == new Rect(2, 2, 4, 4) && red.pivot == new Vector2(1, 3) && red.pixelsPerUnit == 32 && red.border == new Vector4(1, 1, 1, 1), "Authored geometry changed");
         a.gameObject.SetActive(false); service.Cache.Trim();

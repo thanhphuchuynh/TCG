@@ -21,7 +21,7 @@ namespace TCG.SwitchStreaming
             public CardArtOwner Marker;
             public CanvasGroup Group;
             public float Alpha;
-            public bool Hidden, Active = true, Visible = true, Queued;
+            public bool Hidden, Interactable, BlocksRaycasts, Active = true, Visible = true, Queued;
             public int Generation;
             public Action Refresh;
             public Frame Frame;
@@ -133,12 +133,14 @@ namespace TCG.SwitchStreaming
         static void Hide(State state)
         {
             if (state.Hidden || !state.Group) return;
-            state.Alpha = state.Group.alpha; state.Group.alpha = 0; state.Hidden = true;
+            state.Alpha = state.Group.alpha;
+            state.Interactable = state.Group.interactable; state.BlocksRaycasts = state.Group.blocksRaycasts;
+            state.Group.alpha = 0; state.Group.interactable = false; state.Group.blocksRaycasts = false; state.Hidden = true;
         }
         static void Show(State state)
         {
             if (!state.Hidden || !state.Group) return;
-            state.Group.alpha = state.Alpha; state.Hidden = false;
+            state.Group.alpha = state.Alpha; state.Group.interactable = state.Interactable; state.Group.blocksRaycasts = state.BlocksRaycasts; state.Hidden = false;
         }
         static void ClearImages(State state, Dictionary<string, ArtCache<LoadedArtBundle>.Lease> old, Dictionary<string, ArtCache<LoadedArtBundle>.Lease> keep)
         {

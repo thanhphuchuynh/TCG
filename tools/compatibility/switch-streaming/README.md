@@ -42,3 +42,10 @@ uses UnityPy to compare compressed texture payloads and authored sprite geometry
 check resident leakage, mesh duplication, quality and FAT32 limits. It fails for
 missing or ambiguous comparisons. It is read-only; its private reports must not
 be uploaded with the game assets.
+
+`localization_probe.py PROJECT` is an optional investigation tool for the separate
+startup initialization exception. It preserves the original source in
+`.tcg-localization-probe`, adds five no-inline boundaries and bounded primitive
+stage markers, and logs then rethrows the original exception. It supplies no
+fallback language or game-state bypass. Do not treat installing the probe as a
+startup fix.
